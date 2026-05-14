@@ -46,7 +46,7 @@ def run_ps_score_exact_anndata(
     counts_layer: str | None = "counts",
     perturbations: Sequence[str] | None = None,
     target_genes: Mapping[str, Sequence[str]] | Sequence[str] | None = None,
-    target_gene_source: str = "provided",
+    target_gene_source: str = "hvg",
     hvg_key: str = "highly_variable",
     target_gene_min: int = 10,
     target_gene_max: int = 500,
@@ -523,6 +523,7 @@ def _resolve_scanpy_target_genes(
     gene_lookup: Mapping[str, int],
     target_gene_min: int,
     target_gene_max: int,
+    de_method: str = 't-test'
 ) -> dict[str, list[str]]:
     try:
         import scanpy as sc
@@ -543,6 +544,7 @@ def _resolve_scanpy_target_genes(
         use_raw=False,
         layer=layer,
         n_genes=target_gene_max,
+        method = de_method
     )
 
     genes_by_perturbation: dict[str, list[str]] = {}
@@ -670,19 +672,15 @@ def _solve_ridge_beta(x_matrix: np.ndarray, y_matrix: np.ndarray, lr_lambda: flo
     try:
         factor = linalg.cho_factor(ridge, lower=True, check_finite=True)
     except linalg.LinAlgError as error:
-        if lr_lambda == 0.0:
-            try:
-                return np.asarray(
-                    linalg.solve(ridge, rhs, assume_a="sym", check_finite=True),
-                    dtype=float,
-                )
-            except linalg.LinAlgError as fallback_error:
-                raise ValueError(
-                    "Ridge system is not solvable under the requested lr_lambda"
-                ) from fallback_error
-        raise ValueError(
-            "Ridge system is not solvable under the requested lr_lambda"
-        ) from error
+        try:
+            return np.asarray(
+                linalg.solve(ridge, rhs, assume_a="sym", check_finite=True),
+                dtype=float,
+            )
+        except linalg.LinAlgError as fallback_error:
+            raise ValueError(
+                "Ridge system is not solvable with cholesky or default solve"
+            ) from fallback_error
     return np.asarray(linalg.cho_solve(factor, rhs, check_finite=True), dtype=float)
 
 
@@ -713,7 +711,7 @@ def _compute_scores(
             if score_solver == "closed_form":
                 raw = (centered @ perturbation_beta - score_lambda) / beta_norm_sq
                 bounded = np.clip(raw, 0.0, scale_factor)
-            else:
+            elif score_solver == "lsq_linear":
                 bounded = _solve_bounded_scores_lsq_linear(
                     centered=centered,
                     perturbation_beta=perturbation_beta,
@@ -721,6 +719,10 @@ def _compute_scores(
                     score_lambda=score_lambda,
                     scale_factor=scale_factor,
                 )
+            else:
+                raise NotImplementedError(
+                "ps score solver not supported: use closed_form or lsq_linear"
+            )
             score_matrix[target_mask, column_index] = bounded / scale_factor
         max_before_scaling = float(score_matrix[:, column_index].max(initial=0.0))
         if scale_score and max_before_scaling > 0:
