@@ -10,6 +10,7 @@ from perturb_effects import (
     run_mixscape_anndata,
     run_mixscape_stream,
     run_ps_score_anndata,
+    run_ps_score_exact_anndata,
     run_ps_score_stream,
 )
 
@@ -149,6 +150,54 @@ def test_phase7_smoke_ps_score_all_modes_share_expected_schema() -> None:
     target_exact = stream_exact[stream_exact["perturbation_label"] == "pert-a"]["ps_score"]
     control_exact = stream_exact[stream_exact["perturbation_label"] == "control"]["ps_score"]
     assert target_exact.median() > control_exact.median()
+
+
+def test_phase7_smoke_public_exact_ps_api_supports_provided_and_hvg_targets() -> None:
+    adata = _make_ps_adata()
+    adata.var["exact_hvg"] = [False, False, True, True]
+
+    provided = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="counts",
+        perturbations=["pert-a"],
+        target_genes={"pert-a": ["g0", "g1"]},
+        target_gene_min=1,
+        target_gene_max=2,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        scale_score=False,
+    )
+    hvg = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="counts",
+        perturbations=["pert-b"],
+        target_gene_source="hvg",
+        hvg_key="exact_hvg",
+        target_gene_min=1,
+        target_gene_max=2,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        scale_score=False,
+    )
+
+    assert not provided.empty
+    assert not hvg.empty
+    assert set(provided["method"]) == {"ps_score_exact"}
+    assert set(provided["target_perturbation"]) == {"pert-a"}
+    assert np.allclose(
+        provided.loc[provided["perturbation_label"] == "control", "ps_score"],
+        0.0,
+    )
+    assert provided.attrs["ps_score_exact"]["target_gene_source"] == "provided"
+    assert hvg.attrs["ps_score_exact"]["target_gene_source_detail"] == {
+        "mode": "hvg",
+        "hvg_key": "exact_hvg",
+    }
+    assert hvg.attrs["ps_score_exact"]["genes_by_perturbation"] == {"pert-b": ["g2", "g3"]}
 
 
 def _batch_factory(matrix: np.ndarray, row_ids: np.ndarray):

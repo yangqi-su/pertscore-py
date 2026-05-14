@@ -10,6 +10,7 @@ def test_public_api_exports_exist() -> None:
     assert perturb_effects.run_mixscape_anndata is not None
     assert perturb_effects.run_mixscape_stream is not None
     assert perturb_effects.run_ps_score_anndata is not None
+    assert perturb_effects.run_ps_score_exact_anndata is not None
     assert perturb_effects.run_ps_score_stream is not None
 
 
