@@ -128,6 +128,35 @@ def get_obs_column(obs: Any, key: str) -> list[Any]:
     raise TypeError("obs must be a dataframe-like object, mapping, or sequence of mappings")
 
 
+def get_obs_row_ids(obs: Any) -> list[Any]:
+    """Extract stable row identifiers from streamed observation metadata."""
+
+    if hasattr(obs, "index"):
+        return list(obs.index)
+
+    if isinstance(obs, Mapping):
+        for candidate in ("row_id", "row_ids", "index", "obs_names"):
+            if candidate in obs:
+                return list(obs[candidate])
+        raise KeyError("obs mapping must contain row_id, row_ids, index, or obs_names")
+
+    if isinstance(obs, Sequence) and not isinstance(obs, (str, bytes)):
+        row_ids: list[Any] = []
+        for row in obs:
+            if not isinstance(row, Mapping):
+                raise TypeError("obs rows must be mappings when obs is a sequence")
+            if "row_id" in row:
+                row_ids.append(row["row_id"])
+                continue
+            if "index" in row:
+                row_ids.append(row["index"])
+                continue
+            raise KeyError("obs rows must contain row_id or index")
+        return row_ids
+
+    raise TypeError("obs must be a dataframe-like object, mapping, or sequence of mappings")
+
+
 def resolve_perturbations(
     labels: Sequence[Any],
     *,
@@ -228,6 +257,12 @@ def welch_t_scores(case_matrix: Any, control_matrix: Any) -> np.ndarray:
 
     case = summarize_matrix_features(case_matrix)
     control = summarize_matrix_features(control_matrix)
+    return welch_t_scores_from_stats(case, control)
+
+
+def welch_t_scores_from_stats(case: StreamFeatureStats, control: StreamFeatureStats) -> np.ndarray:
+    """Compute per-feature Welch t statistics from pre-aggregated moments."""
+
     if case.count == 0 or control.count == 0:
         raise ValueError("Welch ranking requires at least one case row and one control row")
 

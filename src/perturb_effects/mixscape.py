@@ -1,8 +1,9 @@
-"""Compact AnnData Mixscape implementation with exact and approximate modes."""
+"""Compact Mixscape implementation with AnnData and streamed CSR modes."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -13,13 +14,18 @@ from scipy.spatial.distance import cdist
 
 from .parallel import normalize_n_jobs, run_parallel_tasks
 from .stats import (
+    csr_batch_to_matrix,
     extract_anndata_matrix,
     get_obs_column,
+    get_obs_row_ids,
+    iter_csr_batches,
+    require_reiterable_batches,
     resolve_perturbations,
     validate_fidelity,
     validate_layer,
     validate_perturbations,
     welch_t_scores,
+    welch_t_scores_from_stats,
 )
 
 
@@ -37,6 +43,13 @@ RESULT_COLUMNS = [
     "marker_gene_count",
     "iteration_count",
 ]
+
+
+@dataclass(frozen=True)
+class _BufferedRows:
+    matrix: sparse.csr_matrix
+    row_ids: np.ndarray
+    labels: np.ndarray
 
 
 def run_mixscape_anndata(
@@ -162,24 +175,138 @@ def run_mixscape_stream(
     fidelity: str = "exact",
     perturbations: Sequence[str] | None = None,
     n_jobs: int | None = 1,
-) -> Any:
-    """Validate the streamed Mixscape API contract for later phases."""
+    n_neighbors: int = 20,
+    marker_top_k: int | None = None,
+    min_de_genes: int = 1,
+    iter_num: int = 10,
+    scale: bool = True,
+    control_sample_size: int | None = None,
+    perturbation_sample_size: int | None = None,
+    random_state: int | None = 0,
+) -> pd.DataFrame:
+    """Score streamed CSR batches with exact or approximate Mixscape semantics."""
 
     if batches is None:
         raise ValueError("batches must not be None")
     if obs is None:
         raise ValueError("obs must not be None")
-    if not isinstance(var_names, Sequence) or isinstance(var_names, str):
+    if isinstance(var_names, str):
         raise TypeError("var_names must be a sequence of feature names")
     if not isinstance(perturbation_key, str) or not perturbation_key:
         raise ValueError("perturbation_key must be a non-empty string")
     if not isinstance(control_label, str) or not control_label:
         raise ValueError("control_label must be a non-empty string")
-    validate_fidelity(fidelity)
+    fidelity = validate_fidelity(fidelity)
     validate_perturbations(perturbations)
     normalize_n_jobs(n_jobs)
-    raise NotImplementedError(
-        "Mixscape streamed execution is not implemented yet; Phase 3 only adds the AnnData path."
+    _validate_positive_int("n_neighbors", n_neighbors)
+    _validate_positive_int("min_de_genes", min_de_genes)
+    _validate_positive_int("iter_num", iter_num)
+    _validate_optional_positive_int("marker_top_k", marker_top_k)
+    _validate_optional_positive_int("control_sample_size", control_sample_size)
+    _validate_optional_positive_int("perturbation_sample_size", perturbation_sample_size)
+
+    labels = np.asarray(get_obs_column(obs, perturbation_key), dtype=object)
+    row_ids = np.asarray(get_obs_row_ids(obs), dtype=object)
+    if labels.size == 0:
+        raise ValueError("obs must contain at least one observation")
+    if row_ids.shape[0] != labels.shape[0]:
+        raise ValueError("obs row identifiers and perturbation labels must have the same length")
+    if not np.any(labels == control_label):
+        raise ValueError(f"control_label {control_label!r} was not found in obs[{perturbation_key!r}]")
+
+    selected = resolve_perturbations(
+        labels,
+        control_label=control_label,
+        perturbations=perturbations,
+    )
+    if not selected:
+        return _annotate_stream_result(
+            _empty_result_frame(),
+            fidelity=fidelity,
+            perturbation_key=perturbation_key,
+            control_label=control_label,
+            perturbations=[],
+            metadata={},
+            stream_mode="none",
+        )
+
+    var_names_array = np.asarray(var_names, dtype=object)
+    if var_names_array.ndim != 1 or var_names_array.size == 0:
+        raise ValueError("var_names must be a non-empty one-dimensional sequence")
+    label_by_row_id = _build_label_lookup(row_ids=row_ids, labels=labels)
+    base_seed = 0 if random_state is None else int(random_state)
+
+    if fidelity == "exact":
+        batch_factory = require_reiterable_batches(
+            batches,
+            operation="run_mixscape_stream exact mode",
+        )
+        worker = lambda perturbation: _run_stream_exact_for_perturbation(
+            batches=batch_factory,
+            perturbation=perturbation,
+            label_by_row_id=label_by_row_id,
+            var_names=var_names_array,
+            control_label=control_label,
+            n_neighbors=n_neighbors,
+            marker_top_k=marker_top_k,
+            min_de_genes=min_de_genes,
+            iter_num=iter_num,
+            scale=scale,
+        )
+        outputs = run_parallel_tasks(selected, worker, n_jobs=n_jobs)
+        stream_mode = "multi-pass"
+    elif callable(batches):
+        worker = lambda perturbation: _run_stream_approx_for_perturbation(
+            batches=batches,
+            perturbation=perturbation,
+            label_by_row_id=label_by_row_id,
+            var_names=var_names_array,
+            control_label=control_label,
+            marker_top_k=marker_top_k,
+            min_de_genes=min_de_genes,
+            scale=scale,
+            control_sample_size=control_sample_size,
+            perturbation_sample_size=perturbation_sample_size,
+            seed=_stable_seed(base_seed, str(perturbation)),
+        )
+        outputs = run_parallel_tasks(selected, worker, n_jobs=n_jobs)
+        stream_mode = "multi-pass"
+    else:
+        buffered_control, buffered_targets = _buffer_stream_rows(
+            batches=batches,
+            selected=selected,
+            label_by_row_id=label_by_row_id,
+            control_label=control_label,
+            n_features=var_names_array.size,
+        )
+        worker = lambda perturbation: _run_stream_approx_from_buffered_rows(
+            perturbation=perturbation,
+            control_rows=buffered_control,
+            target_rows=buffered_targets[perturbation],
+            var_names=var_names_array,
+            control_label=control_label,
+            marker_top_k=marker_top_k,
+            min_de_genes=min_de_genes,
+            scale=scale,
+            control_sample_size=control_sample_size,
+            perturbation_sample_size=perturbation_sample_size,
+            seed=_stable_seed(base_seed, str(perturbation)),
+        )
+        outputs = run_parallel_tasks(selected, worker, n_jobs=n_jobs)
+        stream_mode = "buffered-one-shot"
+
+    frames = [frame for frame, _ in outputs]
+    metadata = {perturbation: meta for (_, meta), perturbation in zip(outputs, selected, strict=False)}
+    result = pd.concat(frames, ignore_index=True) if frames else _empty_result_frame()
+    return _annotate_stream_result(
+        result,
+        fidelity=fidelity,
+        perturbation_key=perturbation_key,
+        control_label=control_label,
+        perturbations=list(selected),
+        metadata=metadata,
+        stream_mode=stream_mode,
     )
 
 
@@ -246,6 +373,80 @@ def _run_exact_for_perturbation(
         "method": "knn_signature_gmm",
         "reference_mode": "knn-control",
         "iteration_count": iterations,
+    }
+    return frame, metadata
+
+
+def _run_stream_exact_for_perturbation(
+    *,
+    batches: Any,
+    perturbation: Any,
+    label_by_row_id: dict[Any, Any],
+    var_names: np.ndarray,
+    control_label: str,
+    n_neighbors: int,
+    marker_top_k: int | None,
+    min_de_genes: int,
+    iter_num: int,
+    scale: bool,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    control_stats, target_stats = _collect_stream_feature_stats(
+        batches=batches,
+        perturbation=perturbation,
+        label_by_row_id=label_by_row_id,
+        control_label=control_label,
+        n_features=var_names.size,
+    )
+    _validate_cell_counts_from_stats(control_stats.count, target_stats.count, perturbation=perturbation, control_label=control_label)
+
+    marker_indices = _select_stream_marker_indices(
+        target_stats=target_stats,
+        control_stats=control_stats,
+        min_de_genes=min_de_genes,
+        marker_top_k=marker_top_k,
+    )
+    combined_rows, control_rows = _collect_stream_rows_for_perturbation(
+        batches=batches,
+        perturbation=perturbation,
+        label_by_row_id=label_by_row_id,
+        control_label=control_label,
+        marker_indices=marker_indices,
+        n_features=var_names.size,
+    )
+    signature = _knn_signature(combined_rows.matrix.toarray(), control_rows.matrix.toarray(), n_neighbors=n_neighbors)
+    if scale:
+        signature = _scale_columns(signature)
+
+    control_pos = np.flatnonzero(combined_rows.labels == control_label)
+    target_pos = np.flatnonzero(combined_rows.labels == perturbation)
+    projections, posterior, target_mask, iterations = _iterative_exact_classification(
+        signature=signature,
+        control_pos=control_pos,
+        target_pos=target_pos,
+        iter_num=iter_num,
+    )
+    frame = _build_result_frame(
+        row_ids=combined_rows.row_ids,
+        perturbation_labels=combined_rows.labels,
+        target_perturbation=str(perturbation),
+        control_label=control_label,
+        fidelity="exact",
+        method="knn_signature_gmm",
+        reference_mode="knn-control-streamed",
+        marker_gene_count=marker_indices.size,
+        iteration_count=iterations,
+        projections=projections,
+        posterior=posterior,
+        target_pos=target_pos,
+        target_mask=target_mask,
+    )
+    metadata = {
+        "marker_genes": var_names[marker_indices].tolist(),
+        "n_neighbors": min(n_neighbors, control_stats.count),
+        "method": "knn_signature_gmm",
+        "reference_mode": "knn-control-streamed",
+        "iteration_count": iterations,
+        "stream_semantics": "multi-pass selected-marker exact projection with buffered control-marker kNN",
     }
     return frame, metadata
 
@@ -323,6 +524,116 @@ def _run_approx_for_perturbation(
     return frame, metadata
 
 
+def _run_stream_approx_for_perturbation(
+    *,
+    batches: Any,
+    perturbation: Any,
+    label_by_row_id: dict[Any, Any],
+    var_names: np.ndarray,
+    control_label: str,
+    marker_top_k: int | None,
+    min_de_genes: int,
+    scale: bool,
+    control_sample_size: int | None,
+    perturbation_sample_size: int | None,
+    seed: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    control_stats, target_stats = _collect_stream_feature_stats(
+        batches=batches,
+        perturbation=perturbation,
+        label_by_row_id=label_by_row_id,
+        control_label=control_label,
+        n_features=var_names.size,
+    )
+    _validate_cell_counts_from_stats(control_stats.count, target_stats.count, perturbation=perturbation, control_label=control_label)
+
+    marker_indices = _select_stream_marker_indices(
+        target_stats=target_stats,
+        control_stats=control_stats,
+        min_de_genes=min_de_genes,
+        marker_top_k=marker_top_k if marker_top_k is not None else 20,
+    )
+    combined_rows, control_rows = _collect_stream_rows_for_perturbation(
+        batches=batches,
+        perturbation=perturbation,
+        label_by_row_id=label_by_row_id,
+        control_label=control_label,
+        marker_indices=marker_indices,
+        n_features=var_names.size,
+    )
+    return _finish_stream_approx_result(
+        perturbation=perturbation,
+        combined_rows=combined_rows,
+        control_rows=control_rows,
+        var_names=var_names,
+        control_label=control_label,
+        marker_indices=marker_indices,
+        scale=scale,
+        control_sample_size=control_sample_size,
+        perturbation_sample_size=perturbation_sample_size,
+        seed=seed,
+        stream_semantics="multi-pass selected-marker centroid projection",
+    )
+
+
+def _run_stream_approx_from_buffered_rows(
+    *,
+    perturbation: Any,
+    control_rows: _BufferedRows,
+    target_rows: _BufferedRows,
+    var_names: np.ndarray,
+    control_label: str,
+    marker_top_k: int | None,
+    min_de_genes: int,
+    scale: bool,
+    control_sample_size: int | None,
+    perturbation_sample_size: int | None,
+    seed: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    _validate_cell_counts_from_stats(
+        control_rows.matrix.shape[0],
+        target_rows.matrix.shape[0],
+        perturbation=perturbation,
+        control_label=control_label,
+    )
+    rng = np.random.default_rng(seed)
+    sampled_control = _sample_positions(control_rows.matrix.shape[0], control_sample_size, rng)
+    sampled_target = _sample_positions(target_rows.matrix.shape[0], perturbation_sample_size, rng)
+    marker_indices = _select_marker_indices(
+        de_matrix=sparse.vstack([control_rows.matrix, target_rows.matrix], format="csr"),
+        target_idx=control_rows.matrix.shape[0] + sampled_target,
+        control_idx=sampled_control,
+        min_de_genes=min_de_genes,
+        marker_top_k=marker_top_k if marker_top_k is not None else 20,
+    )
+    combined_rows = _BufferedRows(
+        matrix=sparse.vstack(
+            [control_rows.matrix[:, marker_indices], target_rows.matrix[:, marker_indices]],
+            format="csr",
+        ),
+        row_ids=np.concatenate([control_rows.row_ids, target_rows.row_ids]),
+        labels=np.concatenate([control_rows.labels, target_rows.labels]),
+    )
+    marker_control_rows = _BufferedRows(
+        matrix=control_rows.matrix[:, marker_indices],
+        row_ids=control_rows.row_ids,
+        labels=control_rows.labels,
+    )
+    return _finish_stream_approx_result(
+        perturbation=perturbation,
+        combined_rows=combined_rows,
+        control_rows=marker_control_rows,
+        var_names=var_names,
+        control_label=control_label,
+        marker_indices=marker_indices,
+        scale=scale,
+        control_sample_size=control_sample_size,
+        perturbation_sample_size=perturbation_sample_size,
+        seed=seed,
+        stream_semantics="buffered sparse one-shot centroid projection",
+    )
+
+
 def _validate_cell_counts(
     control_idx: np.ndarray,
     target_idx: np.ndarray,
@@ -333,6 +644,19 @@ def _validate_cell_counts(
     if control_idx.size < 2:
         raise ValueError(f"Mixscape requires at least 2 {control_label!r} control cells")
     if target_idx.size < 2:
+        raise ValueError(f"Mixscape requires at least 2 cells for perturbation {perturbation!r}")
+
+
+def _validate_cell_counts_from_stats(
+    control_count: int,
+    target_count: int,
+    *,
+    perturbation: Any,
+    control_label: str,
+) -> None:
+    if control_count < 2:
+        raise ValueError(f"Mixscape requires at least 2 {control_label!r} control cells")
+    if target_count < 2:
         raise ValueError(f"Mixscape requires at least 2 cells for perturbation {perturbation!r}")
 
 
@@ -354,6 +678,26 @@ def _select_marker_indices(
     if marker_top_k is not None:
         selected = selected[:marker_top_k]
     required = min(max(1, min_de_genes), target_expr.shape[1])
+    if selected.size < required:
+        raise ValueError(f"Mixscape found fewer than {required} marker genes for this perturbation")
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _select_stream_marker_indices(
+    *,
+    target_stats: Any,
+    control_stats: Any,
+    min_de_genes: int,
+    marker_top_k: int | None,
+) -> np.ndarray:
+    scores = welch_t_scores_from_stats(target_stats, control_stats)
+    mean_diff = target_stats.means() - control_stats.means()
+    ranking = np.argsort(-np.abs(scores), kind="stable")
+    positive = ranking[mean_diff[ranking] > 0]
+    selected = positive if positive.size else ranking
+    if marker_top_k is not None:
+        selected = selected[:marker_top_k]
+    required = min(max(1, min_de_genes), target_stats.n_features)
     if selected.size < required:
         raise ValueError(f"Mixscape found fewer than {required} marker genes for this perturbation")
     return np.asarray(selected, dtype=np.int64)
@@ -484,6 +828,261 @@ def _fit_fixed_reference_gmm(
     return np.exp(log_p1 - log_norm)
 
 
+def _build_label_lookup(*, row_ids: np.ndarray, labels: np.ndarray) -> dict[Any, Any]:
+    lookup: dict[Any, Any] = {}
+    for row_id, label in zip(row_ids, labels, strict=False):
+        if row_id in lookup:
+            raise ValueError(f"obs contains duplicate row_id {row_id!r}")
+        lookup[row_id] = label
+    return lookup
+
+
+def _batch_labels(batch_row_ids: Sequence[Any], label_by_row_id: dict[Any, Any]) -> np.ndarray:
+    labels: list[Any] = []
+    missing: list[str] = []
+    for row_id in batch_row_ids:
+        if row_id not in label_by_row_id:
+            missing.append(str(row_id))
+            continue
+        labels.append(label_by_row_id[row_id])
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise KeyError(f"batch row_ids were not found in obs: {preview}")
+    return np.asarray(labels, dtype=object)
+
+
+def _collect_stream_feature_stats(
+    *,
+    batches: Any,
+    perturbation: Any,
+    label_by_row_id: dict[Any, Any],
+    control_label: str,
+    n_features: int,
+) -> tuple[Any, Any]:
+    control_count = 0
+    target_count = 0
+    control_sums = np.zeros(n_features, dtype=float)
+    target_sums = np.zeros(n_features, dtype=float)
+    control_squared = np.zeros(n_features, dtype=float)
+    target_squared = np.zeros(n_features, dtype=float)
+
+    for batch in iter_csr_batches(batches):
+        _validate_stream_feature_count(batch.shape[1], n_features)
+        matrix = csr_batch_to_matrix(batch)
+        labels = _batch_labels(batch.row_ids, label_by_row_id)
+        control_mask = labels == control_label
+        target_mask = labels == perturbation
+        if control_mask.any():
+            control_block = matrix[control_mask]
+            control_count += int(control_block.shape[0])
+            control_sums += np.asarray(control_block.sum(axis=0)).ravel()
+            control_squared += np.asarray(control_block.power(2).sum(axis=0)).ravel()
+        if target_mask.any():
+            target_block = matrix[target_mask]
+            target_count += int(target_block.shape[0])
+            target_sums += np.asarray(target_block.sum(axis=0)).ravel()
+            target_squared += np.asarray(target_block.power(2).sum(axis=0)).ravel()
+
+    from .types import StreamFeatureStats
+
+    return (
+        StreamFeatureStats(count=control_count, sums=control_sums, squared_sums=control_squared),
+        StreamFeatureStats(count=target_count, sums=target_sums, squared_sums=target_squared),
+    )
+
+
+def _collect_stream_rows_for_perturbation(
+    *,
+    batches: Any,
+    perturbation: Any,
+    label_by_row_id: dict[Any, Any],
+    control_label: str,
+    marker_indices: np.ndarray,
+    n_features: int,
+) -> tuple[_BufferedRows, _BufferedRows]:
+    combined_parts: list[sparse.csr_matrix] = []
+    control_parts: list[sparse.csr_matrix] = []
+    combined_row_ids: list[np.ndarray] = []
+    combined_labels: list[np.ndarray] = []
+    control_row_ids: list[np.ndarray] = []
+
+    for batch in iter_csr_batches(batches):
+        _validate_stream_feature_count(batch.shape[1], n_features)
+        matrix = csr_batch_to_matrix(batch)
+        labels = _batch_labels(batch.row_ids, label_by_row_id)
+        row_ids = np.asarray(batch.row_ids, dtype=object)
+        control_mask = labels == control_label
+        target_mask = labels == perturbation
+        combined_mask = control_mask | target_mask
+        if combined_mask.any():
+            combined_parts.append(matrix[combined_mask][:, marker_indices].tocsr())
+            combined_row_ids.append(row_ids[combined_mask])
+            combined_labels.append(labels[combined_mask])
+        if control_mask.any():
+            control_parts.append(matrix[control_mask][:, marker_indices].tocsr())
+            control_row_ids.append(row_ids[control_mask])
+
+    if not combined_parts or not control_parts:
+        raise ValueError(f"stream did not yield rows for perturbation {perturbation!r}")
+
+    control_labels = np.full(sum(len(ids) for ids in control_row_ids), control_label, dtype=object)
+    return (
+        _BufferedRows(
+            matrix=sparse.vstack(combined_parts, format="csr"),
+            row_ids=np.concatenate(combined_row_ids),
+            labels=np.concatenate(combined_labels),
+        ),
+        _BufferedRows(
+            matrix=sparse.vstack(control_parts, format="csr"),
+            row_ids=np.concatenate(control_row_ids),
+            labels=control_labels,
+        ),
+    )
+
+
+def _buffer_stream_rows(
+    *,
+    batches: Any,
+    selected: Sequence[Any],
+    label_by_row_id: dict[Any, Any],
+    control_label: str,
+    n_features: int,
+) -> tuple[_BufferedRows, dict[Any, _BufferedRows]]:
+    control_parts: list[sparse.csr_matrix] = []
+    control_row_ids: list[np.ndarray] = []
+    target_parts: dict[Any, list[sparse.csr_matrix]] = {perturbation: [] for perturbation in selected}
+    target_row_ids: dict[Any, list[np.ndarray]] = {perturbation: [] for perturbation in selected}
+
+    for batch in iter_csr_batches(batches):
+        _validate_stream_feature_count(batch.shape[1], n_features)
+        matrix = csr_batch_to_matrix(batch)
+        labels = _batch_labels(batch.row_ids, label_by_row_id)
+        row_ids = np.asarray(batch.row_ids, dtype=object)
+
+        control_mask = labels == control_label
+        if control_mask.any():
+            control_parts.append(matrix[control_mask].tocsr())
+            control_row_ids.append(row_ids[control_mask])
+
+        for perturbation in selected:
+            target_mask = labels == perturbation
+            if not target_mask.any():
+                continue
+            target_parts[perturbation].append(matrix[target_mask].tocsr())
+            target_row_ids[perturbation].append(row_ids[target_mask])
+
+    if not control_parts:
+        raise ValueError(f"Mixscape requires at least 2 {control_label!r} control cells")
+
+    control_rows = _BufferedRows(
+        matrix=sparse.vstack(control_parts, format="csr"),
+        row_ids=np.concatenate(control_row_ids),
+        labels=np.full(sum(len(ids) for ids in control_row_ids), control_label, dtype=object),
+    )
+    buffered_targets: dict[Any, _BufferedRows] = {}
+    for perturbation in selected:
+        parts = target_parts[perturbation]
+        ids = target_row_ids[perturbation]
+        if not parts:
+            buffered_targets[perturbation] = _BufferedRows(
+                matrix=sparse.csr_matrix((0, n_features), dtype=float),
+                row_ids=np.asarray([], dtype=object),
+                labels=np.asarray([], dtype=object),
+            )
+            continue
+        buffered_targets[perturbation] = _BufferedRows(
+            matrix=sparse.vstack(parts, format="csr"),
+            row_ids=np.concatenate(ids),
+            labels=np.full(sum(len(part) for part in ids), perturbation, dtype=object),
+        )
+    return control_rows, buffered_targets
+
+
+def _finish_stream_approx_result(
+    *,
+    perturbation: Any,
+    combined_rows: _BufferedRows,
+    control_rows: _BufferedRows,
+    var_names: np.ndarray,
+    control_label: str,
+    marker_indices: np.ndarray,
+    scale: bool,
+    control_sample_size: int | None,
+    perturbation_sample_size: int | None,
+    seed: int,
+    stream_semantics: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    rng = np.random.default_rng(seed)
+    control_count = int(control_rows.matrix.shape[0])
+    target_pos = np.flatnonzero(combined_rows.labels == perturbation)
+    sampled_control = _sample_positions(control_count, control_sample_size, rng)
+    sampled_target_relative = _sample_positions(target_pos.size, perturbation_sample_size, rng)
+    reference_target_pos = target_pos[sampled_target_relative]
+
+    combined_expr = combined_rows.matrix.toarray()
+    control_expr = control_rows.matrix.toarray()
+    reference_expr = control_expr[sampled_control].mean(axis=0, keepdims=True)
+    signature = np.repeat(reference_expr, combined_expr.shape[0], axis=0) - combined_expr
+    if scale:
+        signature = _scale_columns(signature)
+
+    control_pos = np.flatnonzero(combined_rows.labels == control_label)
+    projections, posterior, target_mask = _approximate_classification(
+        signature=signature,
+        control_pos=control_pos,
+        target_pos=target_pos,
+        reference_target_pos=reference_target_pos,
+    )
+    frame = _build_result_frame(
+        row_ids=combined_rows.row_ids,
+        perturbation_labels=combined_rows.labels,
+        target_perturbation=str(perturbation),
+        control_label=control_label,
+        fidelity="approx",
+        method="centroid_projection",
+        reference_mode="control-centroid-streamed",
+        marker_gene_count=marker_indices.size,
+        iteration_count=1,
+        projections=projections,
+        posterior=posterior,
+        target_pos=target_pos,
+        target_mask=target_mask,
+    )
+    metadata = {
+        "marker_genes": var_names[marker_indices].tolist(),
+        "method": "centroid_projection",
+        "reference_mode": "control-centroid-streamed",
+        "control_sample_size": int(sampled_control.size),
+        "perturbation_sample_size": int(sampled_target_relative.size),
+        "iteration_count": 1,
+        "stream_semantics": stream_semantics,
+    }
+    return frame, metadata
+
+
+def _annotate_stream_result(
+    result: pd.DataFrame,
+    *,
+    fidelity: str,
+    perturbation_key: str,
+    control_label: str,
+    perturbations: list[Any],
+    metadata: dict[Any, Any],
+    stream_mode: str,
+) -> pd.DataFrame:
+    result.attrs["mixscape"] = {
+        "algorithm": "mixscape",
+        "input_mode": "stream",
+        "fidelity": fidelity,
+        "perturbation_key": perturbation_key,
+        "control_label": control_label,
+        "perturbations": perturbations,
+        "metadata_by_perturbation": metadata,
+        "stream_mode": stream_mode,
+    }
+    return result
+
+
 def _build_result_frame(
     *,
     row_ids: np.ndarray,
@@ -554,8 +1153,20 @@ def _sample_indices(indices: np.ndarray, sample_size: int | None, rng: np.random
     return selected.astype(np.int64, copy=False)
 
 
+def _sample_positions(size: int, sample_size: int | None, rng: np.random.Generator) -> np.ndarray:
+    indices = np.arange(size, dtype=np.int64)
+    return _sample_indices(indices, sample_size, rng)
+
+
 def _stable_seed(base_seed: int, label: str) -> int:
     return int(base_seed + sum((offset + 1) * ord(char) for offset, char in enumerate(label)))
+
+
+def _validate_stream_feature_count(batch_features: int, expected_features: int) -> None:
+    if batch_features != expected_features:
+        raise ValueError(
+            f"batch feature count {batch_features} does not match len(var_names)={expected_features}"
+        )
 
 
 def _log_normal_pdf(x: np.ndarray, mean: float, variance: float) -> np.ndarray:
