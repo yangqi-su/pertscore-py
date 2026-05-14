@@ -131,7 +131,7 @@ def get_obs_column(obs: Any, key: str) -> list[Any]:
 def get_obs_row_ids(obs: Any) -> list[Any]:
     """Extract stable row identifiers from streamed observation metadata."""
 
-    if hasattr(obs, "index"):
+    if hasattr(obs, "index") and not callable(obs.index):
         return list(obs.index)
 
     if isinstance(obs, Mapping):

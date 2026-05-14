@@ -37,21 +37,22 @@ def test_invalid_fidelity_is_rejected_before_execution() -> None:
         )
 
 
-def test_phase1_stubs_raise_not_implemented_for_valid_calls() -> None:
-    with pytest.raises(NotImplementedError):
-        perturb_effects.run_ps_score_stream(
-            [
-                CsrBatch(
-                    row_ids=["cell-1"],
-                    indptr=[0, 1],
-                    indices=[0],
-                    data=[1.0],
-                    shape=(1, 1),
-                )
-            ],
-            obs=[{"perturbation": "control"}],
-            var_names=["gene-1"],
-            perturbation_key="perturbation",
-            control_label="control",
-            fidelity="approx",
-        )
+def test_stream_ps_api_returns_empty_frame_when_only_control_rows_are_present() -> None:
+    result = perturb_effects.run_ps_score_stream(
+        [
+            CsrBatch(
+                row_ids=["cell-1"],
+                indptr=[0, 1],
+                indices=[0],
+                data=[1.0],
+                shape=(1, 1),
+            )
+        ],
+        obs=[{"row_id": "cell-1", "perturbation": "control"}],
+        var_names=["gene-1"],
+        perturbation_key="perturbation",
+        control_label="control",
+        fidelity="approx",
+    )
+
+    assert result.empty
