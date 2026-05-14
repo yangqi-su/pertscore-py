@@ -624,3 +624,39 @@ def test_quantile_clipping_is_optional_at_the_requested_095_quantile() -> None:
     assert np.allclose(clipped.attrs["ps_score_exact"]["clip_values"], [385.0])
     assert clipped.attrs["ps_score_exact"]["clip_quantile"] == 0.95
     assert unclipped.attrs["ps_score_exact"]["clip_values"] is None
+
+
+def test_exact_ps_records_stage_timings_and_observer_events() -> None:
+    adata = _make_target_strategy_adata()
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    result = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        perturbations=["pertA"],
+        target_genes={"pertA": ["g1", "g4"]},
+        target_gene_source="provided",
+        target_gene_min=1,
+        target_gene_max=2,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        scale_score=False,
+        stage_observer=lambda stage, event, details: events.append((stage, event, dict(details))),
+    )
+
+    stage_timings = result.attrs["ps_score_exact"]["stage_timings"]
+
+    assert set(stage_timings) == {"target_gene_selection", "beta_solve", "scoring"}
+    assert all(stage_timings[name] >= 0.0 for name in stage_timings)
+    assert [stage for stage, event, _ in events if event == "start"] == [
+        "target_gene_selection",
+        "beta_solve",
+        "scoring",
+    ]
+    assert [stage for stage, event, _ in events if event == "end"] == [
+        "target_gene_selection",
+        "beta_solve",
+        "scoring",
+    ]

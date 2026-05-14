@@ -9,7 +9,8 @@ Use `ps_score.py` for the existing compact signature-style PS-score path.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+import time
 from typing import Any
 
 import numpy as np
@@ -60,6 +61,7 @@ def run_ps_score_exact_anndata(
     scale_score: bool = True,
     score_solver: str = "closed_form",
     return_wide: bool = False,
+    stage_observer: Callable[[str, str, Mapping[str, Any]], None] | None = None,
 ) -> pd.DataFrame:
     """Run the exact single-label scMAGeCK-style PS-score workflow on AnnData.
 
@@ -153,42 +155,6 @@ def run_ps_score_exact_anndata(
         apply_gene_filter=apply_gene_filter,
     )
 
-    genes_by_perturbation, source_metadata = _resolve_target_genes_by_perturbation(
-        adata,
-        labels_all=labels_all,
-        perturb_column=perturb_column,
-        ctrl_name=ctrl_name,
-        selected_perturbations=selected_perturbations,
-        target_genes=target_genes,
-        target_gene_source=target_gene_source,
-        hvg_key=hvg_key,
-        target_gene_min=target_gene_min,
-        target_gene_max=target_gene_max,
-        layer=layer,
-        cell_mask=cell_mask,
-        gene_lookup=gene_lookup,
-    )
-
-    filter_metadata = _filter_target_genes(
-        filter_matrix=filter_matrix,
-        cell_indices=cell_indices,
-        labels=labels,
-        ctrl_name=ctrl_name,
-        selected_perturbations=selected_perturbations,
-        genes_by_perturbation=genes_by_perturbation,
-        gene_lookup=gene_lookup,
-        target_gene_min=target_gene_min,
-        gene_filter_min_fraction=gene_filter_min_fraction,
-        apply_gene_filter=apply_gene_filter,
-    )
-    filtered_genes_by_perturbation = filter_metadata["genes_by_perturbation"]
-
-    union_genes = _ordered_union(
-        filtered_genes_by_perturbation[perturbation]
-        for perturbation in selected_perturbations
-    )
-    union_gene_indices = np.asarray([gene_lookup[gene] for gene in union_genes], dtype=np.int64)
-
     use_sparse_closed_form, sparse_fallback_reason = _resolve_sparse_computation_mode(
         expression_matrix=expression_matrix,
         score_solver=score_solver,
@@ -197,69 +163,116 @@ def run_ps_score_exact_anndata(
 
     x_shape = (int(labels.shape[0]), len(selected_perturbations) + 1)
     clip_values: np.ndarray | None = None
-    if use_sparse_closed_form:
-        y_matrix = _select_matrix(
-            expression_matrix,
-            cell_indices,
-            union_gene_indices,
-            preserve_sparse=True,
+    stage_timings: dict[str, float] = {}
+
+    def _run_instrumented_stage(name: str, func: Callable[[], Any]) -> Any:
+        _notify_stage_observer(stage_observer, name, "start")
+        start = time.perf_counter()
+        try:
+            value = func()
+        except Exception as error:
+            duration = time.perf_counter() - start
+            stage_timings[name] = float(duration)
+            _notify_stage_observer(
+                stage_observer,
+                name,
+                "error",
+                duration_seconds=float(duration),
+                error=str(error),
+            )
+            raise
+        duration = time.perf_counter() - start
+        stage_timings[name] = float(duration)
+        _notify_stage_observer(
+            stage_observer,
+            name,
+            "end",
+            duration_seconds=float(duration),
         )
-        beta = _solve_ridge_beta_sparse(
-            labels=labels,
+        return value
+
+    def _resolve_and_filter_target_genes() -> tuple[
+        dict[str, list[str]],
+        dict[str, Any],
+        dict[str, Any],
+    ]:
+        genes_by_perturbation, source_metadata_local = _resolve_target_genes_by_perturbation(
+            adata,
+            labels_all=labels_all,
+            perturb_column=perturb_column,
+            ctrl_name=ctrl_name,
             selected_perturbations=selected_perturbations,
-            y_matrix=y_matrix,
-            lr_lambda=lr_lambda,
+            target_genes=target_genes,
+            target_gene_source=target_gene_source,
+            hvg_key=hvg_key,
+            target_gene_min=target_gene_min,
+            target_gene_max=target_gene_max,
+            layer=layer,
+            cell_mask=cell_mask,
+            gene_lookup=gene_lookup,
         )
-        result, score_metadata = _build_sparse_result(
-            row_ids=row_ids,
+        filter_metadata_local = _filter_target_genes(
+            filter_matrix=filter_matrix,
+            cell_indices=cell_indices,
             labels=labels,
             ctrl_name=ctrl_name,
             selected_perturbations=selected_perturbations,
-            y_matrix=y_matrix,
-            beta=beta,
-            selected_target_gene_counts={
-                perturbation: len(filtered_genes_by_perturbation[perturbation])
-                for perturbation in selected_perturbations
-            },
-            scale_factor=scale_factor,
-            score_lambda=score_lambda,
-            lr_lambda=lr_lambda,
-            scale_score=scale_score,
-            return_wide=return_wide,
+            genes_by_perturbation=genes_by_perturbation,
+            gene_lookup=gene_lookup,
+            target_gene_min=target_gene_min,
+            gene_filter_min_fraction=gene_filter_min_fraction,
+            apply_gene_filter=apply_gene_filter,
         )
-    else:
-        y_matrix = _select_dense(expression_matrix, cell_indices, union_gene_indices)
-        if apply_quantile_clip:
-            y_matrix, clip_values = _clip_columns(y_matrix, clip_quantile)
+        return genes_by_perturbation, source_metadata_local, filter_metadata_local
 
-        x_matrix = _build_design_matrix(labels, selected_perturbations)
-        beta = _solve_ridge_beta(x_matrix, y_matrix, lr_lambda)
-        score_matrix, score_metadata = _compute_scores(
-            y_matrix=y_matrix,
-            labels=labels,
-            ctrl_name=ctrl_name,
-            selected_perturbations=selected_perturbations,
-            beta=beta,
-            score_lambda=score_lambda,
-            scale_factor=scale_factor,
-            scale_score=scale_score,
-            score_solver=score_solver,
-        )
+    (
+        genes_by_perturbation,
+        source_metadata,
+        filter_metadata,
+    ) = _run_instrumented_stage("target_gene_selection", _resolve_and_filter_target_genes)
+    filtered_genes_by_perturbation = filter_metadata["genes_by_perturbation"]
 
-        if return_wide:
-            result = _build_wide_result(
-                row_ids=row_ids,
+    union_genes = _ordered_union(
+        filtered_genes_by_perturbation[perturbation]
+        for perturbation in selected_perturbations
+    )
+    union_gene_indices = np.asarray([gene_lookup[gene] for gene in union_genes], dtype=np.int64)
+
+    def _solve_beta_stage() -> tuple[Any, np.ndarray]:
+        nonlocal clip_values
+        if use_sparse_closed_form:
+            y_matrix_local = _select_matrix(
+                expression_matrix,
+                cell_indices,
+                union_gene_indices,
+                preserve_sparse=True,
+            )
+            beta_local = _solve_ridge_beta_sparse(
                 labels=labels,
                 selected_perturbations=selected_perturbations,
-                score_matrix=score_matrix,
+                y_matrix=y_matrix_local,
+                lr_lambda=lr_lambda,
             )
-        else:
-            result = _build_long_result(
+            return y_matrix_local, beta_local
+
+        y_matrix_local = _select_dense(expression_matrix, cell_indices, union_gene_indices)
+        if apply_quantile_clip:
+            y_matrix_local, clip_values = _clip_columns(y_matrix_local, clip_quantile)
+        x_matrix = _build_design_matrix(labels, selected_perturbations)
+        beta_local = _solve_ridge_beta(x_matrix, y_matrix_local, lr_lambda)
+        return y_matrix_local, beta_local
+
+    y_matrix, beta = _run_instrumented_stage("beta_solve", _solve_beta_stage)
+
+    if use_sparse_closed_form:
+        def _build_sparse_result_stage() -> tuple[pd.DataFrame, dict[str, Any]]:
+            return _build_sparse_result(
                 row_ids=row_ids,
                 labels=labels,
                 ctrl_name=ctrl_name,
                 selected_perturbations=selected_perturbations,
-                score_matrix=score_matrix,
+                y_matrix=y_matrix,
+                beta=beta,
                 selected_target_gene_counts={
                     perturbation: len(filtered_genes_by_perturbation[perturbation])
                     for perturbation in selected_perturbations
@@ -267,7 +280,50 @@ def run_ps_score_exact_anndata(
                 scale_factor=scale_factor,
                 score_lambda=score_lambda,
                 lr_lambda=lr_lambda,
+                scale_score=scale_score,
+                return_wide=return_wide,
             )
+
+        result, score_metadata = _run_instrumented_stage("scoring", _build_sparse_result_stage)
+    else:
+        def _build_dense_result_stage() -> tuple[pd.DataFrame, dict[str, Any]]:
+            score_matrix, score_metadata_local = _compute_scores(
+                y_matrix=y_matrix,
+                labels=labels,
+                ctrl_name=ctrl_name,
+                selected_perturbations=selected_perturbations,
+                beta=beta,
+                score_lambda=score_lambda,
+                scale_factor=scale_factor,
+                scale_score=scale_score,
+                score_solver=score_solver,
+            )
+
+            if return_wide:
+                result_local = _build_wide_result(
+                    row_ids=row_ids,
+                    labels=labels,
+                    selected_perturbations=selected_perturbations,
+                    score_matrix=score_matrix,
+                )
+            else:
+                result_local = _build_long_result(
+                    row_ids=row_ids,
+                    labels=labels,
+                    ctrl_name=ctrl_name,
+                    selected_perturbations=selected_perturbations,
+                    score_matrix=score_matrix,
+                    selected_target_gene_counts={
+                        perturbation: len(filtered_genes_by_perturbation[perturbation])
+                        for perturbation in selected_perturbations
+                    },
+                    scale_factor=scale_factor,
+                    score_lambda=score_lambda,
+                    lr_lambda=lr_lambda,
+                )
+            return result_local, score_metadata_local
+
+        result, score_metadata = _run_instrumented_stage("scoring", _build_dense_result_stage)
 
     metadata = {
         "algorithm": "ps_score_exact",
@@ -308,10 +364,22 @@ def run_ps_score_exact_anndata(
         "x_shape": x_shape,
         "y_shape": tuple(int(value) for value in y_matrix.shape),
         "beta_shape": tuple(int(value) for value in beta.shape),
+        "stage_timings": stage_timings,
         "score_metadata": score_metadata,
     }
     result.attrs["ps_score_exact"] = metadata
     return result
+
+
+def _notify_stage_observer(
+    observer: Callable[[str, str, Mapping[str, Any]], None] | None,
+    stage_name: str,
+    event: str,
+    **details: Any,
+) -> None:
+    if observer is None:
+        return
+    observer(stage_name, event, details)
 
 
 def _validate_adata_like(adata: Any) -> None:
