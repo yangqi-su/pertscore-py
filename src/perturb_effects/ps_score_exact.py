@@ -189,24 +189,85 @@ def run_ps_score_exact_anndata(
     )
     union_gene_indices = np.asarray([gene_lookup[gene] for gene in union_genes], dtype=np.int64)
 
-    y_matrix = _select_dense(expression_matrix, cell_indices, union_gene_indices)
-    clip_values: np.ndarray | None = None
-    if apply_quantile_clip:
-        y_matrix, clip_values = _clip_columns(y_matrix, clip_quantile)
-
-    x_matrix = _build_design_matrix(labels, selected_perturbations)
-    beta = _solve_ridge_beta(x_matrix, y_matrix, lr_lambda)
-    score_matrix, score_metadata = _compute_scores(
-        y_matrix=y_matrix,
-        labels=labels,
-        ctrl_name=ctrl_name,
-        selected_perturbations=selected_perturbations,
-        beta=beta,
-        score_lambda=score_lambda,
-        scale_factor=scale_factor,
-        scale_score=scale_score,
+    use_sparse_closed_form, sparse_fallback_reason = _resolve_sparse_computation_mode(
+        expression_matrix=expression_matrix,
         score_solver=score_solver,
+        apply_quantile_clip=apply_quantile_clip,
     )
+
+    x_shape = (int(labels.shape[0]), len(selected_perturbations) + 1)
+    clip_values: np.ndarray | None = None
+    if use_sparse_closed_form:
+        y_matrix = _select_matrix(
+            expression_matrix,
+            cell_indices,
+            union_gene_indices,
+            preserve_sparse=True,
+        )
+        beta = _solve_ridge_beta_sparse(
+            labels=labels,
+            selected_perturbations=selected_perturbations,
+            y_matrix=y_matrix,
+            lr_lambda=lr_lambda,
+        )
+        result, score_metadata = _build_sparse_result(
+            row_ids=row_ids,
+            labels=labels,
+            ctrl_name=ctrl_name,
+            selected_perturbations=selected_perturbations,
+            y_matrix=y_matrix,
+            beta=beta,
+            selected_target_gene_counts={
+                perturbation: len(filtered_genes_by_perturbation[perturbation])
+                for perturbation in selected_perturbations
+            },
+            scale_factor=scale_factor,
+            score_lambda=score_lambda,
+            lr_lambda=lr_lambda,
+            scale_score=scale_score,
+            return_wide=return_wide,
+        )
+    else:
+        y_matrix = _select_dense(expression_matrix, cell_indices, union_gene_indices)
+        if apply_quantile_clip:
+            y_matrix, clip_values = _clip_columns(y_matrix, clip_quantile)
+
+        x_matrix = _build_design_matrix(labels, selected_perturbations)
+        beta = _solve_ridge_beta(x_matrix, y_matrix, lr_lambda)
+        score_matrix, score_metadata = _compute_scores(
+            y_matrix=y_matrix,
+            labels=labels,
+            ctrl_name=ctrl_name,
+            selected_perturbations=selected_perturbations,
+            beta=beta,
+            score_lambda=score_lambda,
+            scale_factor=scale_factor,
+            scale_score=scale_score,
+            score_solver=score_solver,
+        )
+
+        if return_wide:
+            result = _build_wide_result(
+                row_ids=row_ids,
+                labels=labels,
+                selected_perturbations=selected_perturbations,
+                score_matrix=score_matrix,
+            )
+        else:
+            result = _build_long_result(
+                row_ids=row_ids,
+                labels=labels,
+                ctrl_name=ctrl_name,
+                selected_perturbations=selected_perturbations,
+                score_matrix=score_matrix,
+                selected_target_gene_counts={
+                    perturbation: len(filtered_genes_by_perturbation[perturbation])
+                    for perturbation in selected_perturbations
+                },
+                scale_factor=scale_factor,
+                score_lambda=score_lambda,
+                lr_lambda=lr_lambda,
+            )
 
     metadata = {
         "algorithm": "ps_score_exact",
@@ -218,6 +279,15 @@ def run_ps_score_exact_anndata(
         "perturbations": list(selected_perturbations),
         "target_gene_source": target_gene_source,
         "target_gene_source_detail": source_metadata,
+        "expression_matrix_format": "sparse" if sparse.issparse(expression_matrix) else "dense",
+        "computation_path": (
+            "sparse_closed_form"
+            if use_sparse_closed_form
+            else "dense_fallback"
+            if sparse.issparse(expression_matrix)
+            else "dense"
+        ),
+        "sparse_fallback_reason": sparse_fallback_reason,
         "target_gene_min": int(target_gene_min),
         "target_gene_max": int(target_gene_max),
         "genes_by_perturbation": filtered_genes_by_perturbation,
@@ -235,34 +305,11 @@ def run_ps_score_exact_anndata(
         "scale_factor": float(scale_factor),
         "scale_score": bool(scale_score),
         "score_solver": score_solver,
-        "x_shape": tuple(int(value) for value in x_matrix.shape),
+        "x_shape": x_shape,
         "y_shape": tuple(int(value) for value in y_matrix.shape),
         "beta_shape": tuple(int(value) for value in beta.shape),
         "score_metadata": score_metadata,
     }
-
-    if return_wide:
-        result = _build_wide_result(
-            row_ids=row_ids,
-            labels=labels,
-            selected_perturbations=selected_perturbations,
-            score_matrix=score_matrix,
-        )
-    else:
-        result = _build_long_result(
-            row_ids=row_ids,
-            labels=labels,
-            ctrl_name=ctrl_name,
-            selected_perturbations=selected_perturbations,
-            score_matrix=score_matrix,
-            selected_target_gene_counts={
-                perturbation: len(filtered_genes_by_perturbation[perturbation])
-                for perturbation in selected_perturbations
-            },
-            scale_factor=scale_factor,
-            score_lambda=score_lambda,
-            lr_lambda=lr_lambda,
-        )
     result.attrs["ps_score_exact"] = metadata
     return result
 
@@ -605,8 +652,19 @@ def _filter_target_genes(
 
         relevant_rows = np.flatnonzero((labels == ctrl_name) | (labels == perturbation))
         gene_indices = np.asarray([gene_lookup[gene] for gene in genes], dtype=np.int64)
-        candidate = _select_dense(filter_matrix, cell_indices[relevant_rows], gene_indices)
-        keep_fraction = (candidate > 0).mean(axis=0)
+        if sparse.issparse(filter_matrix):
+            candidate = _select_matrix(
+                filter_matrix,
+                cell_indices[relevant_rows],
+                gene_indices,
+                preserve_sparse=True,
+            )
+            keep_fraction = (
+                np.asarray(candidate.getnnz(axis=0), dtype=float).ravel() / float(candidate.shape[0])
+            )
+        else:
+            candidate = _select_dense(filter_matrix, cell_indices[relevant_rows], gene_indices)
+            keep_fraction = (candidate > 0).mean(axis=0)
         keep_mask = keep_fraction >= gene_filter_min_fraction
         kept = [gene for gene, keep in zip(genes, keep_mask, strict=False) if keep]
         if len(kept) < target_gene_min:
@@ -636,20 +694,51 @@ def _ordered_union(groups: Any) -> list[str]:
     return union
 
 
-def _select_dense(
+def _resolve_sparse_computation_mode(
+    *,
+    expression_matrix: Any,
+    score_solver: str,
+    apply_quantile_clip: bool,
+) -> tuple[bool, str | None]:
+    if not sparse.issparse(expression_matrix):
+        return False, None
+    if score_solver != "closed_form":
+        return False, f"score_solver={score_solver}"
+    if apply_quantile_clip:
+        return False, "apply_quantile_clip=True"
+    return True, None
+
+
+def _select_matrix(
     matrix: Any,
     row_indices: np.ndarray,
     col_indices: np.ndarray | None,
-) -> np.ndarray:
+    *,
+    preserve_sparse: bool = False,
+) -> Any:
     if sparse.issparse(matrix):
         subset = matrix[row_indices] if col_indices is None else matrix[row_indices][:, col_indices]
-        return np.asarray(subset.toarray(), dtype=float)
+        sparse_subset = subset.tocsr().astype(float, copy=False)
+        if preserve_sparse:
+            return sparse_subset
+        return sparse_subset
     dense = np.asarray(matrix, dtype=float)
     if dense.ndim != 2:
         raise ValueError("selected matrix must be two-dimensional")
     if col_indices is None:
         return np.asarray(dense[row_indices], dtype=float)
     return np.asarray(dense[np.ix_(row_indices, col_indices)], dtype=float)
+
+
+def _select_dense(
+    matrix: Any,
+    row_indices: np.ndarray,
+    col_indices: np.ndarray | None,
+) -> np.ndarray:
+    selected = _select_matrix(matrix, row_indices, col_indices)
+    if sparse.issparse(selected):
+        return np.asarray(selected.toarray(), dtype=float)
+    return np.asarray(selected, dtype=float)
 
 
 def _clip_columns(matrix: np.ndarray, quantile: float) -> tuple[np.ndarray, np.ndarray]:
@@ -667,8 +756,35 @@ def _build_design_matrix(labels: np.ndarray, selected_perturbations: Sequence[st
 
 def _solve_ridge_beta(x_matrix: np.ndarray, y_matrix: np.ndarray, lr_lambda: float) -> np.ndarray:
     gram = x_matrix.T @ x_matrix
-    ridge = gram + lr_lambda * np.eye(gram.shape[0], dtype=float)
     rhs = x_matrix.T @ y_matrix
+    return _solve_ridge_beta_from_gram_rhs(gram=gram, rhs=rhs, lr_lambda=lr_lambda)
+
+
+def _solve_ridge_beta_sparse(
+    *,
+    labels: np.ndarray,
+    selected_perturbations: Sequence[str],
+    y_matrix: sparse.spmatrix,
+    lr_lambda: float,
+) -> np.ndarray:
+    rhs_rows = [np.asarray(y_matrix.sum(axis=0), dtype=float).ravel()]
+    gram = np.zeros((len(selected_perturbations) + 1, len(selected_perturbations) + 1), dtype=float)
+    gram[0, 0] = float(labels.shape[0])
+
+    for column_index, perturbation in enumerate(selected_perturbations, start=1):
+        target_rows = np.flatnonzero(labels == perturbation)
+        target_count = float(target_rows.size)
+        gram[0, column_index] = target_count
+        gram[column_index, 0] = target_count
+        gram[column_index, column_index] = target_count
+        rhs_rows.append(np.asarray(y_matrix[target_rows].sum(axis=0), dtype=float).ravel())
+
+    rhs = np.vstack(rhs_rows)
+    return _solve_ridge_beta_from_gram_rhs(gram=gram, rhs=rhs, lr_lambda=lr_lambda)
+
+
+def _solve_ridge_beta_from_gram_rhs(*, gram: np.ndarray, rhs: np.ndarray, lr_lambda: float) -> np.ndarray:
+    ridge = gram + lr_lambda * np.eye(gram.shape[0], dtype=float)
     try:
         factor = linalg.cho_factor(ridge, lower=True, check_finite=True)
     except linalg.LinAlgError as error:
@@ -682,6 +798,105 @@ def _solve_ridge_beta(x_matrix: np.ndarray, y_matrix: np.ndarray, lr_lambda: flo
                 "Ridge system is not solvable with cholesky or default solve"
             ) from fallback_error
     return np.asarray(linalg.cho_solve(factor, rhs, check_finite=True), dtype=float)
+
+
+def _build_sparse_result(
+    *,
+    row_ids: np.ndarray,
+    labels: np.ndarray,
+    ctrl_name: str,
+    selected_perturbations: Sequence[str],
+    y_matrix: sparse.spmatrix,
+    beta: np.ndarray,
+    selected_target_gene_counts: Mapping[str, int],
+    scale_factor: float,
+    score_lambda: float,
+    lr_lambda: float,
+    scale_score: bool,
+    return_wide: bool,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    metadata: dict[str, Any] = {}
+    control_mask = labels == ctrl_name
+    wide_matrix = (
+        np.zeros((labels.shape[0], len(selected_perturbations)), dtype=float) if return_wide else None
+    )
+    frames: list[pd.DataFrame] = []
+
+    baseline = np.asarray(beta[0], dtype=float)
+
+    for column_index, perturbation in enumerate(selected_perturbations):
+        target_mask = labels == perturbation
+        target_rows = np.flatnonzero(target_mask)
+        perturbation_beta = np.asarray(beta[column_index + 1], dtype=float)
+        beta_norm_sq = float(np.dot(perturbation_beta, perturbation_beta))
+        if beta_norm_sq <= 0:
+            raise ValueError(f"Perturbation {perturbation!r} produced a zero beta vector")
+
+        projected = np.asarray(y_matrix[target_rows] @ perturbation_beta, dtype=float).ravel()
+        baseline_projection = float(np.dot(baseline, perturbation_beta))
+        scores = np.clip(
+            (projected - baseline_projection - score_lambda) / beta_norm_sq,
+            0.0,
+            scale_factor,
+        ) / scale_factor
+        max_before_scaling = float(scores.max(initial=0.0))
+        if scale_score and max_before_scaling > 0:
+            scores = scores / max_before_scaling
+
+        if return_wide:
+            assert wide_matrix is not None
+            wide_matrix[target_rows, column_index] = scores
+        else:
+            combined_mask = control_mask | target_mask
+            combined_labels = labels[combined_mask]
+            combined_scores = np.zeros(combined_mask.sum(), dtype=float)
+            combined_scores[combined_labels == perturbation] = scores
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "row_id": row_ids[combined_mask],
+                        "perturbation_label": combined_labels,
+                        "target_perturbation": perturbation,
+                        "ps_score": combined_scores,
+                        "method": "ps_score_exact",
+                        "selected_target_gene_count": int(
+                            selected_target_gene_counts[str(perturbation)]
+                        ),
+                        "score_status": np.where(
+                            combined_labels == ctrl_name,
+                            "control-zero",
+                            "optimized-active",
+                        ),
+                        "scale_factor": float(scale_factor),
+                        "score_lambda": float(score_lambda),
+                        "lr_lambda": float(lr_lambda),
+                    }
+                ).loc[:, RESULT_COLUMNS]
+            )
+
+        metadata[str(perturbation)] = {
+            "beta_norm_sq": beta_norm_sq,
+            "control_count": int(np.sum(control_mask)),
+            "target_count": int(target_rows.size),
+            "max_score_before_column_scale": max_before_scaling,
+            "column_scaled": bool(scale_score and max_before_scaling > 0),
+            "score_solver": "closed_form",
+        }
+
+    if return_wide:
+        assert wide_matrix is not None
+        return (
+            _build_wide_result(
+                row_ids=row_ids,
+                labels=labels,
+                selected_perturbations=selected_perturbations,
+                score_matrix=wide_matrix,
+            ),
+            metadata,
+        )
+    if not frames:
+        return _empty_result(return_wide=False), metadata
+    return pd.concat(frames, ignore_index=True), metadata
 
 
 def _compute_scores(

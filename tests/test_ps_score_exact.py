@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 from anndata import AnnData
+from scipy import sparse
 
 import perturb_effects.ps_score_exact as ps_score_exact_module
 from perturb_effects.ps_score_exact import (
@@ -82,6 +84,16 @@ def _make_target_strategy_adata(*, include_counts: bool = True) -> AnnData:
     return adata
 
 
+def _make_sparse_adata(adata: AnnData) -> AnnData:
+    sparse_adata = adata.copy()
+    sparse_adata.X = sparse.csr_matrix(np.asarray(adata.X, dtype=float))
+    for layer_name in list(adata.layers.keys()):
+        sparse_adata.layers[layer_name] = sparse.csr_matrix(
+            np.asarray(adata.layers[layer_name], dtype=float)
+        )
+    return sparse_adata
+
+
 def test_build_design_matrix_has_negctrl_and_single_active_columns() -> None:
     labels = np.array(["control", "pertA", "pertB", "control", "pertA"], dtype=object)
 
@@ -112,6 +124,7 @@ def test_run_ps_score_exact_uses_selected_layer_union_genes_and_clipping() -> No
         ctrl_name="control",
         layer="expr",
         target_genes={"pertA": ["g2", "g1"], "pertB": ["g3", "g2"]},
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=5,
         apply_gene_filter=False,
@@ -191,6 +204,7 @@ def test_exact_scores_match_closed_form_with_control_zero_and_scale_factor() -> 
         ctrl_name="control",
         layer="expr",
         target_genes=["g1", "g2"],
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=5,
         apply_gene_filter=False,
@@ -230,6 +244,7 @@ def test_scale_score_normalizes_by_column_max_after_scale_factor_division() -> N
         ctrl_name="control",
         layer="expr",
         target_genes=["g1", "g2"],
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=5,
         apply_gene_filter=False,
@@ -244,6 +259,7 @@ def test_scale_score_normalizes_by_column_max_after_scale_factor_division() -> N
         ctrl_name="control",
         layer="expr",
         target_genes=["g1", "g2"],
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=5,
         apply_gene_filter=False,
@@ -271,6 +287,7 @@ def test_lsq_linear_score_solver_matches_closed_form_scores() -> None:
         ctrl_name="control",
         layer="expr",
         target_genes=["g1", "g2"],
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=5,
         apply_gene_filter=False,
@@ -287,6 +304,7 @@ def test_lsq_linear_score_solver_matches_closed_form_scores() -> None:
         ctrl_name="control",
         layer="expr",
         target_genes=["g1", "g2"],
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=5,
         apply_gene_filter=False,
@@ -315,6 +333,7 @@ def test_provided_target_gene_mapping_deduplicates_and_truncates_by_max() -> Non
             "pertA": ["g1", "g1", "g2", "g3"],
             "pertB": ["g4", "g3", "g4"],
         },
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=2,
         apply_gene_filter=False,
@@ -353,6 +372,7 @@ def test_provided_target_genes_raise_for_missing_or_too_few_genes(
             layer="expr",
             perturbations=["pertA"],
             target_genes=target_genes,
+            target_gene_source="provided",
             target_gene_min=target_gene_min,
             target_gene_max=4,
             apply_gene_filter=False,
@@ -443,6 +463,7 @@ def test_gene_filter_uses_counts_layer_when_available() -> None:
         layer="expr",
         perturbations=["pertA"],
         target_genes=["g1", "g2"],
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=4,
         apply_gene_filter=True,
@@ -469,6 +490,7 @@ def test_gene_filter_falls_back_to_selected_expression_layer_without_counts() ->
         layer="expr",
         perturbations=["pertA"],
         target_genes=["g1", "g2"],
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=4,
         apply_gene_filter=True,
@@ -485,6 +507,89 @@ def test_gene_filter_falls_back_to_selected_expression_layer_without_counts() ->
     assert metadata["gene_filter_metadata"]["target_gene_counts_after_filter"] == {"pertA": 2}
 
 
+def test_sparse_closed_form_matches_dense_outputs_and_selects_sparse_path() -> None:
+    dense_adata = _make_target_strategy_adata(include_counts=True)
+    sparse_adata = _make_sparse_adata(dense_adata)
+
+    kwargs = dict(
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        target_genes={
+            "pertA": ["g1", "g2", "g3"],
+            "pertB": ["g4", "g3", "g2"],
+        },
+        target_gene_source="provided",
+        target_gene_min=1,
+        target_gene_max=3,
+        apply_gene_filter=True,
+        gene_filter_min_fraction=0.5,
+        apply_quantile_clip=False,
+        lr_lambda=0.1,
+        score_lambda=0.05,
+        scale_factor=2.0,
+        scale_score=True,
+    )
+
+    dense_result = run_ps_score_exact_anndata(dense_adata, **kwargs)
+    sparse_result = run_ps_score_exact_anndata(sparse_adata, **kwargs)
+
+    pd.testing.assert_frame_equal(sparse_result, dense_result)
+
+    dense_metadata = dense_result.attrs["ps_score_exact"]
+    sparse_metadata = sparse_result.attrs["ps_score_exact"]
+    assert sparse_metadata["computation_path"] == "sparse_closed_form"
+    assert sparse_metadata["expression_matrix_format"] == "sparse"
+    assert sparse_metadata["sparse_fallback_reason"] is None
+    assert sparse_metadata["genes_by_perturbation"] == dense_metadata["genes_by_perturbation"]
+    assert sparse_metadata["score_metadata"].keys() == dense_metadata["score_metadata"].keys()
+    for perturbation in sparse_metadata["score_metadata"]:
+        assert sparse_metadata["score_metadata"][perturbation]["score_solver"] == "closed_form"
+        assert sparse_metadata["score_metadata"][perturbation]["control_count"] == dense_metadata[
+            "score_metadata"
+        ][perturbation]["control_count"]
+        assert sparse_metadata["score_metadata"][perturbation]["target_count"] == dense_metadata[
+            "score_metadata"
+        ][perturbation]["target_count"]
+        assert sparse_metadata["score_metadata"][perturbation]["column_scaled"] == dense_metadata[
+            "score_metadata"
+        ][perturbation]["column_scaled"]
+        assert sparse_metadata["score_metadata"][perturbation]["beta_norm_sq"] == pytest.approx(
+            dense_metadata["score_metadata"][perturbation]["beta_norm_sq"]
+        )
+        assert sparse_metadata["score_metadata"][perturbation][
+            "max_score_before_column_scale"
+        ] == pytest.approx(dense_metadata["score_metadata"][perturbation]["max_score_before_column_scale"])
+
+
+def test_sparse_quantile_clip_falls_back_to_dense_path() -> None:
+    dense_adata = _make_layer_selection_adata()
+    sparse_adata = _make_sparse_adata(dense_adata)
+
+    kwargs = dict(
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        target_genes={"pertA": ["g2", "g1"], "pertB": ["g3", "g2"]},
+        target_gene_source="provided",
+        target_gene_min=1,
+        target_gene_max=5,
+        apply_gene_filter=False,
+        apply_quantile_clip=True,
+        clip_quantile=0.5,
+        lr_lambda=0.0,
+        scale_score=False,
+    )
+
+    dense_result = run_ps_score_exact_anndata(dense_adata, **kwargs)
+    sparse_result = run_ps_score_exact_anndata(sparse_adata, **kwargs)
+
+    pd.testing.assert_frame_equal(sparse_result, dense_result)
+    sparse_metadata = sparse_result.attrs["ps_score_exact"]
+    assert sparse_metadata["computation_path"] == "dense_fallback"
+    assert sparse_metadata["sparse_fallback_reason"] == "apply_quantile_clip=True"
+
+
 def test_quantile_clipping_is_optional_at_the_requested_095_quantile() -> None:
     adata = _make_layer_selection_adata()
 
@@ -494,6 +599,7 @@ def test_quantile_clipping_is_optional_at_the_requested_095_quantile() -> None:
         ctrl_name="control",
         layer="expr",
         target_genes={"pertA": ["g3"], "pertB": ["g3"]},
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=2,
         apply_gene_filter=False,
@@ -507,6 +613,7 @@ def test_quantile_clipping_is_optional_at_the_requested_095_quantile() -> None:
         ctrl_name="control",
         layer="expr",
         target_genes={"pertA": ["g3"], "pertB": ["g3"]},
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=2,
         apply_gene_filter=False,

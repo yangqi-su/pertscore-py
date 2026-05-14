@@ -163,6 +163,7 @@ def test_phase7_smoke_public_exact_ps_api_supports_provided_and_hvg_targets() ->
         layer="counts",
         perturbations=["pert-a"],
         target_genes={"pert-a": ["g0", "g1"]},
+        target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=2,
         apply_gene_filter=False,
