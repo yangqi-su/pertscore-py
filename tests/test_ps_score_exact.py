@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from anndata import AnnData
 
+import perturb_effects.ps_score_exact as ps_score_exact_module
 from perturb_effects.ps_score_exact import (
     _build_design_matrix,
     _solve_ridge_beta,
@@ -156,6 +157,31 @@ def test_solve_ridge_beta_matches_direct_formula() -> None:
     assert np.allclose(beta, expected)
 
 
+def test_solve_ridge_beta_falls_back_to_direct_solve_when_zero_lambda_cholesky_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x_matrix = np.eye(2)
+    y_matrix = np.array([[1.0, 2.0], [3.0, 4.0]])
+    solve_called = False
+    original_solve = ps_score_exact_module.linalg.solve
+
+    def fake_cho_factor(*args: object, **kwargs: object):
+        raise ps_score_exact_module.linalg.LinAlgError("forced cholesky failure")
+
+    def wrapped_solve(*args: object, **kwargs: object):
+        nonlocal solve_called
+        solve_called = True
+        return original_solve(*args, **kwargs)
+
+    monkeypatch.setattr(ps_score_exact_module.linalg, "cho_factor", fake_cho_factor)
+    monkeypatch.setattr(ps_score_exact_module.linalg, "solve", wrapped_solve)
+
+    beta = _solve_ridge_beta(x_matrix, y_matrix, lr_lambda=0.0)
+
+    assert solve_called
+    assert np.allclose(beta, y_matrix)
+
+
 def test_exact_scores_match_closed_form_with_control_zero_and_scale_factor() -> None:
     adata = _make_single_perturbation_adata()
 
@@ -234,6 +260,47 @@ def test_scale_score_normalizes_by_column_max_after_scale_factor_division() -> N
     assert np.allclose(scaled_scores.to_numpy(), expected_scaled.to_numpy())
     assert np.isclose(scaled_scores.loc["pert-a-1"], 0.2)
     assert np.isclose(scaled_scores.loc["pert-a-2"], 1.0)
+
+
+def test_lsq_linear_score_solver_matches_closed_form_scores() -> None:
+    adata = _make_single_perturbation_adata()
+
+    closed_form = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        target_genes=["g1", "g2"],
+        target_gene_min=1,
+        target_gene_max=5,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        lr_lambda=0.0,
+        score_lambda=0.1,
+        scale_factor=1.5,
+        scale_score=False,
+        score_solver="closed_form",
+    )
+    lsq = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        target_genes=["g1", "g2"],
+        target_gene_min=1,
+        target_gene_max=5,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        lr_lambda=0.0,
+        score_lambda=0.1,
+        scale_factor=1.5,
+        scale_score=False,
+        score_solver="lsq_linear",
+    )
+
+    assert np.allclose(closed_form["ps_score"], lsq["ps_score"])
+    assert lsq.attrs["ps_score_exact"]["score_solver"] == "lsq_linear"
+    assert lsq.attrs["ps_score_exact"]["score_metadata"]["pertA"]["score_solver"] == "lsq_linear"
 
 
 def test_provided_target_gene_mapping_deduplicates_and_truncates_by_max() -> None:

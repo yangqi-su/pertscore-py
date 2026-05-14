@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy import linalg, sparse
+from scipy.optimize import lsq_linear
 
 from .stats import extract_anndata_matrix, get_obs_column, resolve_perturbations, validate_layer
 
@@ -26,6 +27,7 @@ RESULT_COLUMNS = [
 ]
 
 SUPPORTED_TARGET_GENE_SOURCES = ("provided", "scanpy_de", "hvg")
+SUPPORTED_SCORE_SOLVERS = ("closed_form", "lsq_linear")
 
 
 def run_ps_score_exact_anndata(
@@ -49,6 +51,7 @@ def run_ps_score_exact_anndata(
     score_lambda: float = 0.0,
     scale_factor: float = 3.0,
     scale_score: bool = True,
+    score_solver: str = "closed_form",
     return_wide: bool = False,
 ) -> pd.DataFrame:
     """Run the exact single-label scMAGeCK-style PS-score workflow on AnnData."""
@@ -83,6 +86,7 @@ def run_ps_score_exact_anndata(
     lr_lambda = _validate_non_negative_float("lr_lambda", lr_lambda)
     score_lambda = _validate_non_negative_float("score_lambda", score_lambda)
     scale_factor = _validate_positive_float("scale_factor", scale_factor)
+    score_solver = _validate_score_solver(score_solver)
     _validate_bool("apply_gene_filter", apply_gene_filter)
     _validate_bool("apply_quantile_clip", apply_quantile_clip)
     _validate_bool("scale_score", scale_score)
@@ -188,6 +192,7 @@ def run_ps_score_exact_anndata(
         score_lambda=score_lambda,
         scale_factor=scale_factor,
         scale_score=scale_score,
+        score_solver=score_solver,
     )
 
     metadata = {
@@ -216,6 +221,7 @@ def run_ps_score_exact_anndata(
         "score_lambda": float(score_lambda),
         "scale_factor": float(scale_factor),
         "scale_score": bool(scale_score),
+        "score_solver": score_solver,
         "x_shape": tuple(int(value) for value in x_matrix.shape),
         "y_shape": tuple(int(value) for value in y_matrix.shape),
         "beta_shape": tuple(int(value) for value in beta.shape),
@@ -282,6 +288,13 @@ def _validate_target_gene_source(value: str) -> str:
     if value not in SUPPORTED_TARGET_GENE_SOURCES:
         allowed = ", ".join(SUPPORTED_TARGET_GENE_SOURCES)
         raise ValueError(f"Unsupported target_gene_source {value!r}; expected one of: {allowed}")
+    return value
+
+
+def _validate_score_solver(value: str) -> str:
+    if value not in SUPPORTED_SCORE_SOLVERS:
+        allowed = ", ".join(SUPPORTED_SCORE_SOLVERS)
+        raise ValueError(f"Unsupported score_solver {value!r}; expected one of: {allowed}")
     return value
 
 
@@ -644,6 +657,16 @@ def _solve_ridge_beta(x_matrix: np.ndarray, y_matrix: np.ndarray, lr_lambda: flo
     try:
         factor = linalg.cho_factor(ridge, lower=True, check_finite=True)
     except linalg.LinAlgError as error:
+        if lr_lambda == 0.0:
+            try:
+                return np.asarray(
+                    linalg.solve(ridge, rhs, assume_a="sym", check_finite=True),
+                    dtype=float,
+                )
+            except linalg.LinAlgError as fallback_error:
+                raise ValueError(
+                    "Ridge system is not solvable under the requested lr_lambda"
+                ) from fallback_error
         raise ValueError(
             "Ridge system is not solvable under the requested lr_lambda"
         ) from error
@@ -660,6 +683,7 @@ def _compute_scores(
     score_lambda: float,
     scale_factor: float,
     scale_score: bool,
+    score_solver: str,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     score_matrix = np.zeros((labels.shape[0], len(selected_perturbations)), dtype=float)
     baseline = beta[0]
@@ -673,8 +697,17 @@ def _compute_scores(
             raise ValueError(f"Perturbation {perturbation!r} produced a zero beta vector")
         if target_mask.any():
             centered = y_matrix[target_mask] - baseline
-            raw = (centered @ perturbation_beta - score_lambda) / beta_norm_sq
-            bounded = np.clip(raw, 0.0, scale_factor)
+            if score_solver == "closed_form":
+                raw = (centered @ perturbation_beta - score_lambda) / beta_norm_sq
+                bounded = np.clip(raw, 0.0, scale_factor)
+            else:
+                bounded = _solve_bounded_scores_lsq_linear(
+                    centered=centered,
+                    perturbation_beta=perturbation_beta,
+                    beta_norm_sq=beta_norm_sq,
+                    score_lambda=score_lambda,
+                    scale_factor=scale_factor,
+                )
             score_matrix[target_mask, column_index] = bounded / scale_factor
         max_before_scaling = float(score_matrix[:, column_index].max(initial=0.0))
         if scale_score and max_before_scaling > 0:
@@ -685,9 +718,35 @@ def _compute_scores(
             "target_count": int(np.sum(target_mask)),
             "max_score_before_column_scale": max_before_scaling,
             "column_scaled": bool(scale_score and max_before_scaling > 0),
+            "score_solver": score_solver,
         }
 
     return score_matrix, metadata
+
+
+def _solve_bounded_scores_lsq_linear(
+    *,
+    centered: np.ndarray,
+    perturbation_beta: np.ndarray,
+    beta_norm_sq: float,
+    score_lambda: float,
+    scale_factor: float,
+) -> np.ndarray:
+    design = perturbation_beta[:, None]
+    adjusted_targets = centered - (score_lambda / beta_norm_sq) * perturbation_beta
+    scores = np.zeros(centered.shape[0], dtype=float)
+
+    for row_index, target in enumerate(adjusted_targets):
+        result = lsq_linear(
+            design,
+            target,
+            bounds=(0.0, scale_factor),
+            lsq_solver="exact",
+        )
+        if not result.success:
+            raise ValueError("Bounded lsq_linear PS-score solve failed")
+        scores[row_index] = float(result.x[0])
+    return scores
 
 
 def _build_long_result(
