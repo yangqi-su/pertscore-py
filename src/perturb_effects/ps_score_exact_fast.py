@@ -10,7 +10,6 @@ set.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import resource
 import time
@@ -39,6 +38,9 @@ DEFAULT_CLIP_BINS = 2048
 class ExactFastPsResult:
     scores: np.ndarray
     valid_mask: np.ndarray
+    obs_index: np.ndarray
+    labels: np.ndarray
+    control_mask: np.ndarray
     beta: np.ndarray
     union_gene_indices: np.ndarray
     metadata: dict[str, Any]
@@ -51,6 +53,8 @@ class ExactFastMultiLabelPsResult:
     perturbation_indices: np.ndarray
     perturbations: list[str]
     valid_mask: np.ndarray
+    obs_index: np.ndarray
+    control_mask: np.ndarray
     beta: np.ndarray
     union_gene_indices: np.ndarray
     metadata: dict[str, Any]
@@ -89,295 +93,301 @@ def run_ps_score_exact_fast(
     """Run exact-fast PS scoring from an AnnData object or backed h5ad path."""
 
     validate_layer(layer)
-    clip_quantile = _validate_clip_quantile(clip_quantile)
-    clip_bins = _validate_clip_bins(clip_bins)
+    assert clip_quantile is None or 0.0 < clip_quantile <= 1.0
+    assert clip_bins >= 2 and type(clip_bins) == int
     if target_mode not in {"union_deg", "hvg"}:
         raise ValueError("target_mode must be 'union_deg' or 'hvg'")
     if mode not in {"single", "multilabel"}:
         raise ValueError("mode must be 'single' or 'multilabel'")
 
-    adata, dataset_path = _open_if_path(data)
-    try:
-        labels = _clean_obs_labels(adata, perturb_column)
-        matrix = extract_anndata_matrix(adata, layer=layer)
-        parsed = _parse_perturbations(labels, mode=mode, ctrl_name=ctrl_name, perturbations=perturbations)
-        var_names = np.asarray(adata.var_names, dtype=object)
-        stage_start = time.perf_counter()
+    dataset_path = Path(data) if isinstance(data, (str, Path)) else None
+    adata = ad.read_h5ad(dataset_path, backed="r") if dataset_path is not None else data
+    labels = _clean_obs_labels(adata, perturb_column)
+    obs_index = np.asarray(adata.obs_names, dtype=object)
+    matrix = extract_anndata_matrix(adata, layer=layer)
+    parsed = _parse_perturbations(labels, mode=mode, ctrl_name=ctrl_name, perturbations=perturbations)
+    var_names = np.asarray(adata.var_names, dtype=object)
+    stage_start = time.perf_counter()
 
-        full_stats_seconds = 0.0
-        full_stats: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-        if target_mode == "union_deg":
-            stats_start = time.perf_counter()
-            full_stats = _collect_group_stats(
-                matrix,
-                guides=parsed.guides,
-                control_mask=parsed.control_mask,
-                chunk_size=chunk_size,
-                target_sum=target_sum,
-            )
-            full_stats_seconds = time.perf_counter() - stats_start
-            counts = full_stats[2]
-        else:
-            counts = _group_counts(parsed.guides, parsed.control_mask)
-        _check_group_counts(counts, parsed.perturbations)
-
-        targets, target_metadata, target_source = _select_target_genes(
-            adata=adata,
-            target_mode=target_mode,
-            selected_perturbations=parsed.perturbations,
-            var_names=var_names,
-            counts=counts,
-            full_stats=full_stats,
-            target_gene_max=target_gene_max,
-            rank_by_abs_t=rank_by_abs_t,
+    full_stats_seconds = 0.0
+    full_stats: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+    if target_mode == "union_deg":
+        stats_start = time.perf_counter()
+        full_stats = _collect_group_stats(
+            matrix,
+            guides=parsed.guides,
+            control_mask=parsed.control_mask,
+            chunk_size=chunk_size,
+            target_sum=target_sum,
         )
-        union_gene_indices = _ordered_union_indices(targets.values())
+        full_stats_seconds = time.perf_counter() - stats_start
+        counts = full_stats[2]
+    else:
+        counts = _group_counts(parsed.guides, parsed.control_mask)
+    _check_group_counts(counts, parsed.perturbations)
 
-        clip_values = None
-        clip_threshold_seconds = 0.0
-        if clip_quantile is not None:
-            clip_start = time.perf_counter()
-            clip_values = _estimate_histogram_clip_values(
-                matrix,
-                model_rows=parsed.model_mask,
-                union_gene_indices=union_gene_indices,
-                model_cell_count=int(np.count_nonzero(parsed.model_mask)),
-                chunk_size=chunk_size,
-                target_sum=target_sum,
-                quantile=clip_quantile,
-                bins=clip_bins,
-            )
-            clip_threshold_seconds = time.perf_counter() - clip_start
+    targets, target_metadata, target_source = _select_target_genes(
+        adata=adata,
+        target_mode=target_mode,
+        selected_perturbations=parsed.perturbations,
+        var_names=var_names,
+        counts=counts,
+        full_stats=full_stats,
+        target_gene_max=target_gene_max,
+        rank_by_abs_t=rank_by_abs_t,
+    )
+    union_gene_indices = _ordered_union_indices(targets.values())
 
-        clipped_stats_seconds = 0.0
-        ridge_stats_seconds = 0.0
-        if mode == "single":
-            if clip_values is None and full_stats is not None:
-                beta_sums = full_stats[0][:, union_gene_indices]
-            else:
-                clipped_stats_start = time.perf_counter()
-                beta_sums, _, counts = _collect_group_stats(
-                    matrix,
-                    guides=parsed.guides,
-                    control_mask=parsed.control_mask,
-                    gene_indices=union_gene_indices,
-                    clip_values=clip_values,
-                    chunk_size=chunk_size,
-                    target_sum=target_sum,
-                )
-                clipped_stats_seconds = time.perf_counter() - clipped_stats_start
-            ridge_start = time.perf_counter()
-            beta = _solve_single_label_ridge(
-                total_rhs=beta_sums.sum(axis=0),
-                perturbation_rhs=beta_sums[1:],
-                perturbation_counts=counts[1:].astype(np.float64, copy=False),
-                model_cell_count=float(counts.sum()),
-                lr_lambda=float(lr_lambda),
-            )
-            ridge_seconds = time.perf_counter() - ridge_start
-            scores, valid_mask, max_score_by_perturbation, scoring_seconds = _score_single_label(
-                matrix,
-                guides=parsed.guides,
-                beta=beta,
-                union_gene_indices=union_gene_indices,
-                clip_values=clip_values,
-                chunk_size=chunk_size,
-                target_sum=target_sum,
-                score_lambda=score_lambda,
-                scale_factor=scale_factor,
-                scale_score=scale_score,
-            )
+    clip_values = None
+    clip_threshold_seconds = 0.0
+    if clip_quantile is not None:
+        clip_start = time.perf_counter()
+        clip_values = _estimate_histogram_clip_values(
+            matrix,
+            model_rows=parsed.model_mask,
+            union_gene_indices=union_gene_indices,
+            model_cell_count=int(np.count_nonzero(parsed.model_mask)),
+            chunk_size=chunk_size,
+            target_sum=target_sum,
+            quantile=clip_quantile,
+            bins=clip_bins,
+        )
+        clip_threshold_seconds = time.perf_counter() - clip_start
+
+    clipped_stats_seconds = 0.0
+    ridge_stats_seconds = 0.0
+    if mode == "single":
+        if clip_values is None and full_stats is not None:
+            beta_sums = full_stats[0][:, union_gene_indices]
         else:
-            ridge_stats_start = time.perf_counter()
-            xtx, xty = _collect_multilabel_ridge_stats(
+            clipped_stats_start = time.perf_counter()
+            beta_sums, _, counts = _collect_group_stats(
                 matrix,
                 guides=parsed.guides,
                 control_mask=parsed.control_mask,
-                union_gene_indices=union_gene_indices,
+                gene_indices=union_gene_indices,
                 clip_values=clip_values,
                 chunk_size=chunk_size,
                 target_sum=target_sum,
             )
-            ridge_stats_seconds = time.perf_counter() - ridge_stats_start
-            ridge_start = time.perf_counter()
-            beta = np.asarray(spsolve(xtx + sparse.eye(xtx.shape[0], format="csc") * float(lr_lambda), xty), dtype=np.float64)
-            if beta.ndim == 1:
-                beta = beta[:, None]
-            ridge_seconds = time.perf_counter() - ridge_start
-            (
-                scores,
-                cell_indices,
-                perturbation_indices,
-                valid_mask,
-                max_score_by_perturbation,
-                scoring_seconds,
-            ) = _score_multilabel(
-                matrix,
-                guides=parsed.guides,
-                beta=beta,
-                union_gene_indices=union_gene_indices,
-                clip_values=clip_values,
-                chunk_size=chunk_size,
-                target_sum=target_sum,
-                score_lambda=score_lambda,
-                scale_factor=scale_factor,
-                scale_score=scale_score,
-            )
-
-        _add_score_metadata(
-            target_metadata,
-            parsed.perturbations,
+            clipped_stats_seconds = time.perf_counter() - clipped_stats_start
+        ridge_start = time.perf_counter()
+        beta = _solve_single_label_ridge(
+            total_rhs=beta_sums.sum(axis=0),
+            perturbation_rhs=beta_sums[1:],
+            perturbation_counts=counts[1:].astype(np.float64, copy=False),
+            model_cell_count=float(counts.sum()),
+            lr_lambda=float(lr_lambda),
+        )
+        ridge_seconds = time.perf_counter() - ridge_start
+        scores, valid_mask, max_score_by_perturbation, scoring_seconds = _score_single_label(
+            matrix,
+            guides=parsed.guides,
             beta=beta,
-            max_score_by_perturbation=max_score_by_perturbation,
+            union_gene_indices=union_gene_indices,
+            clip_values=clip_values,
+            chunk_size=chunk_size,
+            target_sum=target_sum,
+            score_lambda=score_lambda,
+            scale_factor=scale_factor,
             scale_score=scale_score,
         )
-        metadata = {
-            "algorithm": "ps_score_exact_fast" if mode == "single" else "ps_score_exact_fast_multilabel",
-            "mode": mode,
-            "input_type": f"anndata-{mode}-backed-stream",
-            "layer": layer,
-            "perturb_column": perturb_column,
-            "control_label": ctrl_name,
-            "target_mode": target_mode,
-            "target_gene_source": target_source["mode"],
-            "target_gene_source_detail": target_source,
-            "target_gene_max": int(target_gene_max),
-            "rank_by_abs_t": bool(rank_by_abs_t),
-            "quantile_clip": clip_quantile is not None,
-            "clip_quantile": None if clip_quantile is None else float(clip_quantile),
-            "clip_method": None if clip_quantile is None else "streaming_histogram",
-            "clip_bins": None if clip_quantile is None else int(clip_bins),
-            "clip_value_summary": _summarize_clip_values(clip_values),
-            "chunk_size": int(chunk_size),
-            "target_sum": float(target_sum),
-            "lr_lambda": float(lr_lambda),
-            "score_lambda": float(score_lambda),
-            "scale_factor": float(scale_factor),
-            "scale_score": bool(scale_score),
-            "selected_perturbations": list(parsed.perturbations),
-            "control_cell_count": int(counts[0]),
-            "perturbation_cell_counts": {perturbation: int(counts[index + 1]) for index, perturbation in enumerate(parsed.perturbations)},
-            "union_target_gene_count": int(union_gene_indices.shape[0]),
-            "union_target_genes": [str(var_names[index]) for index in union_gene_indices],
-            "target_gene_metadata": target_metadata,
-            "beta_shape": tuple(int(value) for value in beta.shape),
-            "valid_scored_cell_count": int(np.count_nonzero(valid_mask)),
-            "timings": {
-                "target_stats_seconds": float(full_stats_seconds),
-                "clip_threshold_seconds": float(clip_threshold_seconds),
-                "clipped_sufficient_stats_seconds": float(clipped_stats_seconds),
-                "ridge_sufficient_stats_seconds": float(ridge_stats_seconds),
-                "ridge_solve_seconds": float(ridge_seconds),
-                "scoring_seconds": float(scoring_seconds),
-                "total_seconds": float(time.perf_counter() - stage_start),
-            },
-            "max_rss_kb": _max_rss_kb(),
-        }
-        if mode == "single":
-            metadata["score_vector_shape"] = (int(labels.shape[0]), 1)
-            result = ExactFastPsResult(scores=scores, valid_mask=valid_mask, beta=beta, union_gene_indices=union_gene_indices, metadata=metadata)
-        else:
-            metadata.update(
-                {
-                    "guide_multiplicity": _summarize_guide_multiplicity(parsed.active_counts),
-                    "score_output_format": "long",
-                    "score_count": int(scores.shape[0]),
-                }
-            )
-            result = ExactFastMultiLabelPsResult(
-                scores=scores,
-                cell_indices=cell_indices,
-                perturbation_indices=perturbation_indices,
-                perturbations=list(parsed.perturbations),
-                valid_mask=valid_mask,
-                beta=beta,
-                union_gene_indices=union_gene_indices,
-                metadata=metadata,
-            )
-    finally:
-        if dataset_path is not None:
-            _close_adata(adata)
+    else:
+        ridge_stats_start = time.perf_counter()
+        xtx, xty = _collect_multilabel_ridge_stats(
+            matrix,
+            guides=parsed.guides,
+            control_mask=parsed.control_mask,
+            union_gene_indices=union_gene_indices,
+            clip_values=clip_values,
+            chunk_size=chunk_size,
+            target_sum=target_sum,
+        )
+        ridge_stats_seconds = time.perf_counter() - ridge_stats_start
+        ridge_start = time.perf_counter()
+        beta = np.asarray(spsolve(xtx + sparse.eye(xtx.shape[0], format="csc") * float(lr_lambda), xty), dtype=np.float64)
+        if beta.ndim == 1:
+            beta = beta[:, None]
+        ridge_seconds = time.perf_counter() - ridge_start
+        (
+            scores,
+            cell_indices,
+            perturbation_indices,
+            valid_mask,
+            max_score_by_perturbation,
+            scoring_seconds,
+        ) = _score_multilabel(
+            matrix,
+            guides=parsed.guides,
+            beta=beta,
+            union_gene_indices=union_gene_indices,
+            clip_values=clip_values,
+            chunk_size=chunk_size,
+            target_sum=target_sum,
+            score_lambda=score_lambda,
+            scale_factor=scale_factor,
+            scale_score=scale_score,
+        )
+
+    _add_score_metadata(
+        target_metadata,
+        parsed.perturbations,
+        beta=beta,
+        max_score_by_perturbation=max_score_by_perturbation,
+        scale_score=scale_score,
+    )
+    metadata = {
+        "algorithm": "ps_score_exact_fast" if mode == "single" else "ps_score_exact_fast_multilabel",
+        "mode": mode,
+        "input_type": f"anndata-{mode}-backed-stream",
+        "layer": layer,
+        "perturb_column": perturb_column,
+        "control_label": ctrl_name,
+        "target_mode": target_mode,
+        "target_gene_source": target_source["mode"],
+        "target_gene_source_detail": target_source,
+        "target_gene_max": int(target_gene_max),
+        "rank_by_abs_t": bool(rank_by_abs_t),
+        "quantile_clip": clip_quantile is not None,
+        "clip_quantile": None if clip_quantile is None else float(clip_quantile),
+        "clip_method": None if clip_quantile is None else "streaming_histogram",
+        "clip_bins": None if clip_quantile is None else int(clip_bins),
+        "chunk_size": int(chunk_size),
+        "target_sum": float(target_sum),
+        "lr_lambda": float(lr_lambda),
+        "score_lambda": float(score_lambda),
+        "scale_factor": float(scale_factor),
+        "scale_score": bool(scale_score),
+        "selected_perturbations": list(parsed.perturbations),
+        "control_cell_count": int(counts[0]),
+        "perturbation_cell_counts": {perturbation: int(counts[index + 1]) for index, perturbation in enumerate(parsed.perturbations)},
+        "union_target_gene_count": int(union_gene_indices.shape[0]),
+        "union_target_genes": [str(var_names[index]) for index in union_gene_indices],
+        "target_gene_metadata": target_metadata,
+        "beta_shape": tuple(int(value) for value in beta.shape),
+        "valid_scored_cell_count": int(np.count_nonzero(valid_mask)),
+        "timings": {
+            "target_stats_seconds": float(full_stats_seconds),
+            "clip_threshold_seconds": float(clip_threshold_seconds),
+            "clipped_sufficient_stats_seconds": float(clipped_stats_seconds),
+            "ridge_sufficient_stats_seconds": float(ridge_stats_seconds),
+            "ridge_solve_seconds": float(ridge_seconds),
+            "scoring_seconds": float(scoring_seconds),
+            "total_seconds": float(time.perf_counter() - stage_start),
+        },
+        "max_rss_kb": _max_rss_kb(),
+    }
+    if mode == "single":
+        metadata["score_vector_shape"] = (int(labels.shape[0]), 1)
+        result = ExactFastPsResult(
+            scores=scores,
+            valid_mask=valid_mask,
+            obs_index=obs_index,
+            labels=labels,
+            control_mask=parsed.control_mask,
+            beta=beta,
+            union_gene_indices=union_gene_indices,
+            metadata=metadata,
+        )
+    else:
+        metadata.update(
+            {
+                "guide_multiplicity": _summarize_guide_multiplicity(parsed.active_counts),
+                "scored_pair_count": int(scores.shape[0]),
+            }
+        )
+        result = ExactFastMultiLabelPsResult(
+            scores=scores,
+            cell_indices=cell_indices,
+            perturbation_indices=perturbation_indices,
+            perturbations=list(parsed.perturbations),
+            valid_mask=valid_mask,
+            obs_index=obs_index,
+            control_mask=parsed.control_mask,
+            beta=beta,
+            union_gene_indices=union_gene_indices,
+            metadata=metadata,
+        )
 
     if output_dir is None:
         return result
-    if isinstance(result, ExactFastMultiLabelPsResult):
-        return write_ps_score_exact_fast_multilabel_output(result, output_dir=output_dir, dataset_path=dataset_path)
     return write_ps_score_exact_fast_output(result, output_dir=output_dir, dataset_path=dataset_path)
 
 
 def write_ps_score_exact_fast_output(
-    result: ExactFastPsResult,
+    result: ExactFastPsResult | ExactFastMultiLabelPsResult,
     *,
     output_dir: str | Path,
     dataset_path: str | Path | None = None,
 ) -> dict[str, Any]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    score_path = output_path / "ps-score-exact-fast.npy"
-    valid_mask_path = output_path / "ps-score-exact-fast-valid-mask.npy"
-    target_gene_path = output_path / "ps-score-exact-fast-target-genes.json"
+    score_path = output_path / "ps-score-exact-fast.csv"
     manifest_path = output_path / "ps-score-exact-fast-manifest.json"
 
-    np.save(score_path, result.scores)
-    np.save(valid_mask_path, result.valid_mask)
-    _write_target_gene_metadata(result.metadata, target_gene_path)
+    table = _score_result_dataframe(result)
+    table.to_csv(score_path, index=False)
 
     manifest = dict(result.metadata)
     manifest.update(
         {
             "dataset_path": None if dataset_path is None else str(dataset_path),
-            "score_output_paths": {
-                "normalized_scores": str(score_path),
-                "valid_mask": str(valid_mask_path),
-                "target_gene_metadata": str(target_gene_path),
-            },
+            "score_output_format": "csv_long",
+            "score_count": int(table.shape[0]),
+            "score_output_paths": {"scores": str(score_path)},
         }
     )
     _write_json(manifest, manifest_path)
     return manifest
 
 
-def write_ps_score_exact_fast_multilabel_output(
-    result: ExactFastMultiLabelPsResult,
-    *,
-    output_dir: str | Path,
-    dataset_path: str | Path | None = None,
-) -> dict[str, Any]:
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    score_path = output_path / "ps-score-exact-fast-multilabel.npz"
-    valid_mask_path = output_path / "ps-score-exact-fast-multilabel-valid-mask.npy"
-    perturbation_path = output_path / "ps-score-exact-fast-multilabel-perturbations.tsv"
-    target_gene_path = output_path / "ps-score-exact-fast-multilabel-target-genes.json"
-    manifest_path = output_path / "ps-score-exact-fast-multilabel-manifest.json"
+def _score_result_dataframe(result: ExactFastPsResult | ExactFastMultiLabelPsResult) -> pd.DataFrame:
+    if isinstance(result, ExactFastMultiLabelPsResult):
+        perturbation_names = np.asarray(result.perturbations, dtype=object)
+        control_rows = np.flatnonzero(result.control_mask)
+        missing_rows = np.flatnonzero(~result.control_mask & ~result.valid_mask)
+        table = pd.concat(
+            [
+                pd.DataFrame(
+                    {
+                        "_row_order": result.cell_indices,
+                        "_perturbation_order": result.perturbation_indices,
+                        "obs_index": result.obs_index[result.cell_indices],
+                        "ps_score": result.scores.astype(np.float64, copy=False),
+                        "perturbation": perturbation_names[result.perturbation_indices],
+                    }
+                ),
+                pd.DataFrame(
+                    {
+                        "_row_order": control_rows,
+                        "_perturbation_order": np.full(control_rows.shape[0], -1, dtype=np.int32),
+                        "obs_index": result.obs_index[control_rows],
+                        "ps_score": np.zeros(control_rows.shape[0], dtype=np.float64),
+                        "perturbation": np.full(control_rows.shape[0], result.metadata["control_label"], dtype=object),
+                    }
+                ),
+                pd.DataFrame(
+                    {
+                        "_row_order": missing_rows,
+                        "_perturbation_order": np.full(missing_rows.shape[0], -1, dtype=np.int32),
+                        "obs_index": result.obs_index[missing_rows],
+                        "ps_score": np.full(missing_rows.shape[0], np.nan, dtype=np.float64),
+                        "perturbation": np.full(missing_rows.shape[0], None, dtype=object),
+                    }
+                ),
+            ],
+            ignore_index=True,
+        )
+        table.sort_values(["_row_order", "_perturbation_order"], kind="stable", inplace=True)
+        return table[["obs_index", "ps_score", "perturbation"]]
 
-    np.savez_compressed(
-        score_path,
-        scores=result.scores,
-        cell_indices=result.cell_indices,
-        perturbation_indices=result.perturbation_indices,
-    )
-    np.save(valid_mask_path, result.valid_mask)
-    with perturbation_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(["perturbation_index", "perturbation"])
-        writer.writerows((index, perturbation) for index, perturbation in enumerate(result.perturbations))
-    _write_target_gene_metadata(result.metadata, target_gene_path)
-
-    manifest = dict(result.metadata)
-    manifest.update(
-        {
-            "dataset_path": None if dataset_path is None else str(dataset_path),
-            "score_output_paths": {
-                "long_scores": str(score_path),
-                "valid_mask": str(valid_mask_path),
-                "perturbations": str(perturbation_path),
-                "target_gene_metadata": str(target_gene_path),
-            },
-        }
-    )
-    _write_json(manifest, manifest_path)
-    return manifest
+    scores = np.full(result.obs_index.shape[0], np.nan, dtype=np.float64)
+    perturbations = np.full(result.obs_index.shape[0], None, dtype=object)
+    scores[result.control_mask] = 0.0
+    perturbations[result.control_mask] = result.metadata["control_label"]
+    scores[result.valid_mask] = result.scores[result.valid_mask, 0].astype(np.float64, copy=False)
+    perturbations[result.valid_mask] = result.labels[result.valid_mask]
+    return pd.DataFrame({"obs_index": result.obs_index, "ps_score": scores, "perturbation": perturbations})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1062,18 +1072,6 @@ def _add_score_metadata(
         metadata[perturbation]["column_scaled"] = bool(scale_score and max_score_by_perturbation[index] > 0.0)
 
 
-def _summarize_clip_values(clip_values: np.ndarray | None) -> dict[str, Any] | None:
-    if clip_values is None:
-        return None
-    return {
-        "count": int(clip_values.shape[0]),
-        "min": float(np.min(clip_values)) if clip_values.size else 0.0,
-        "max": float(np.max(clip_values)) if clip_values.size else 0.0,
-        "mean": float(np.mean(clip_values)) if clip_values.size else 0.0,
-        "zero_count": int(np.count_nonzero(clip_values == 0.0)),
-    }
-
-
 def _summarize_guide_multiplicity(active_counts: np.ndarray) -> dict[str, Any]:
     return {
         "min": int(np.min(active_counts)) if active_counts.size else 0,
@@ -1095,42 +1093,6 @@ def _ordered_union_indices(groups: Any) -> np.ndarray:
                 union.append(key)
                 seen.add(key)
     return np.asarray(union, dtype=np.int64)
-
-
-def _validate_clip_quantile(value: float | None) -> float | None:
-    if value is None:
-        return None
-    if value <= 0.0 or value > 1.0:
-        raise ValueError("clip_quantile must be in (0, 1]")
-    return float(value)
-
-
-def _validate_clip_bins(value: int) -> int:
-    if value < 2:
-        raise ValueError("clip_bins must be >= 2")
-    return int(value)
-
-
-def _open_if_path(data: Any) -> tuple[Any, Path | None]:
-    if isinstance(data, (str, Path)):
-        path = Path(data)
-        return ad.read_h5ad(path, backed="r"), path
-    return data, None
-
-
-def _close_adata(adata: Any) -> None:
-    if hasattr(adata, "file") and hasattr(adata.file, "close"):
-        adata.file.close()
-
-
-def _write_target_gene_metadata(metadata: dict[str, Any], path: Path) -> None:
-    _write_json(
-        {
-            "union_target_genes": metadata["union_target_genes"],
-            "target_gene_metadata": metadata["target_gene_metadata"],
-        },
-        path,
-    )
 
 
 def _write_json(value: Any, path: Path) -> None:
@@ -1163,7 +1125,6 @@ __all__ = [
     "build_parser",
     "main",
     "run_ps_score_exact_fast",
-    "write_ps_score_exact_fast_multilabel_output",
     "write_ps_score_exact_fast_output",
 ]
 

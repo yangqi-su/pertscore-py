@@ -201,7 +201,51 @@ def test_selected_perturbations_fail_loudly_when_missing() -> None:
         )
 
 
-def test_multilabel_cli_writes_long_outputs(tmp_path) -> None:
+def test_single_output_csv_marks_controls_and_unselected_cells(tmp_path) -> None:
+    counts = np.asarray(
+        [
+            [5.0, 1.0],
+            [4.0, 1.0],
+            [1.0, 5.0],
+            [3.0, 3.0],
+        ],
+        dtype=np.float64,
+    )
+    adata = AnnData(
+        X=sparse.csr_matrix(counts),
+        obs=pd.DataFrame(
+            {"perturbation": ["control", "control", "pertA", "pertB"]},
+            index=[f"cell_{index}" for index in range(counts.shape[0])],
+        ),
+        var=pd.DataFrame({"highly_variable": [True, True]}, index=["g1", "g2"]),
+    )
+    output_dir = tmp_path / "out"
+
+    manifest = run_ps_score_exact_fast(
+        adata,
+        mode="single",
+        output_dir=output_dir,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        perturbations=["pertA"],
+        target_mode="hvg",
+        chunk_size=2,
+        scale_score=False,
+    )
+
+    score_path = output_dir / "ps-score-exact-fast.csv"
+    table = pd.read_csv(score_path)
+    assert manifest["score_output_format"] == "csv_long"
+    assert manifest["score_count"] == counts.shape[0]
+    assert manifest["score_output_paths"] == {"scores": str(score_path)}
+    assert list(table.columns) == ["obs_index", "ps_score", "perturbation"]
+    assert np.allclose(table.loc[table["perturbation"] == "control", "ps_score"], 0.0)
+    assert table.loc[table["obs_index"] == "cell_2", "perturbation"].item() == "pertA"
+    assert pd.isna(table.loc[table["obs_index"] == "cell_3", "ps_score"].item())
+    assert pd.isna(table.loc[table["obs_index"] == "cell_3", "perturbation"].item())
+
+
+def test_multilabel_cli_writes_long_csv_outputs(tmp_path) -> None:
     counts = np.asarray(
         [
             [4.0, 1.0, 0.0],
@@ -244,10 +288,14 @@ def test_multilabel_cli_writes_long_outputs(tmp_path) -> None:
         ]
     )
 
-    score_path = output_dir / "ps-score-exact-fast-multilabel.npz"
-    assert manifest["score_output_format"] == "long"
-    assert manifest["score_count"] == 4
+    score_path = output_dir / "ps-score-exact-fast.csv"
+    assert manifest["score_output_format"] == "csv_long"
+    assert manifest["score_count"] == 6
+    assert manifest["scored_pair_count"] == 4
+    assert manifest["score_output_paths"] == {"scores": str(score_path)}
     assert score_path.exists()
-    scores = np.load(score_path)
-    assert set(scores.files) == {"scores", "cell_indices", "perturbation_indices"}
-    assert scores["scores"].shape == (4,)
+    table = pd.read_csv(score_path)
+    assert list(table.columns) == ["obs_index", "ps_score", "perturbation"]
+    assert table.shape[0] == 6
+    assert np.allclose(table.loc[table["perturbation"] == "control", "ps_score"], 0.0)
+    assert set(table.loc[table["obs_index"] == "cell_4", "perturbation"]) == {"pertA", "pertB"}
