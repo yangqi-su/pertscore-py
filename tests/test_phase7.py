@@ -9,9 +9,7 @@ from perturb_effects import (
     CsrBatch,
     run_mixscape_anndata,
     run_mixscape_stream,
-    run_ps_score_anndata,
     run_ps_score_exact_anndata,
-    run_ps_score_stream,
 )
 
 
@@ -79,76 +77,6 @@ def test_phase7_smoke_mixscape_all_modes_share_expected_schema() -> None:
     assert stream_approx.attrs["mixscape"]["stream_mode"] == "multi-pass"
     target_exact = stream_exact[stream_exact["perturbation_label"] == "pert-a"]["perturbation_score"]
     control_exact = stream_exact[stream_exact["perturbation_label"] == "control"]["perturbation_score"]
-    assert target_exact.median() > control_exact.median()
-
-
-def test_phase7_smoke_ps_score_all_modes_share_expected_schema() -> None:
-    adata = _make_ps_adata()
-
-    anndata_exact = run_ps_score_anndata(
-        adata,
-        layer="counts",
-        perturbation_key="perturbation",
-        control_label="control",
-        fidelity="exact",
-        perturbations=["pert-a"],
-        target_gene_min=1,
-        target_gene_max=2,
-        scale_factor=3.0,
-        lambda_=0.05,
-        scale_score=True,
-    )
-    anndata_approx = run_ps_score_anndata(
-        adata,
-        layer="counts",
-        perturbation_key="perturbation",
-        control_label="control",
-        fidelity="approx",
-        perturbations=["pert-b"],
-        target_gene_min=1,
-        target_gene_max=2,
-        scale_factor=2.0,
-        scale_score=False,
-    )
-    stream_exact = run_ps_score_stream(
-        _batch_factory(adata.layers["counts"], adata.obs.index.to_numpy()),
-        obs=adata.obs,
-        var_names=adata.var_names,
-        perturbation_key="perturbation",
-        control_label="control",
-        fidelity="exact",
-        perturbations=["pert-a"],
-        target_gene_min=1,
-        target_gene_max=2,
-        scale_factor=3.0,
-        lambda_=0.05,
-        scale_score=True,
-    )
-    stream_approx = run_ps_score_stream(
-        _batch_factory(adata.layers["counts"], adata.obs.index.to_numpy()),
-        obs=adata.obs,
-        var_names=adata.var_names,
-        perturbation_key="perturbation",
-        control_label="control",
-        fidelity="approx",
-        perturbations=["pert-b"],
-        target_gene_min=1,
-        target_gene_max=2,
-        scale_factor=2.0,
-        scale_score=False,
-    )
-
-    assert not anndata_exact.empty
-    assert not anndata_approx.empty
-    assert not stream_exact.empty
-    assert not stream_approx.empty
-    assert list(stream_exact.columns) == list(anndata_exact.columns)
-    assert list(stream_approx.columns) == list(anndata_approx.columns)
-    assert anndata_exact.attrs["ps_score"]["layer"] == "counts"
-    assert stream_exact.attrs["ps_score"]["stream_mode"] == "multi-pass"
-    assert stream_approx.attrs["ps_score"]["stream_mode"] == "multi-pass"
-    target_exact = stream_exact[stream_exact["perturbation_label"] == "pert-a"]["ps_score"]
-    control_exact = stream_exact[stream_exact["perturbation_label"] == "control"]["ps_score"]
     assert target_exact.median() > control_exact.median()
 
 

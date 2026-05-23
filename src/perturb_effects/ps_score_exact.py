@@ -4,7 +4,6 @@ This path is exact for the single-label scMAGeCK PS-score objective after target
 genes are chosen, using an AnnData-derived design matrix, ridge LR beta solve,
 and bounded scalar scores. It does not claim Seurat `FindMarkers` parity for
 target-gene selection and does not support multi-perturbation-per-cell inputs.
-Use `ps_score.py` for the existing compact signature-style PS-score path.
 """
 
 from __future__ import annotations
