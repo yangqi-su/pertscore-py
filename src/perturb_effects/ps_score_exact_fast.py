@@ -87,6 +87,7 @@ def run_ps_score_exact_fast(
     target_sum: float = DEFAULT_TARGET_SUM,
     rank_by_abs_t: bool = True,
     scale_score: bool = True,
+    logfc_threshold: float | None = 0.1,
     clip_quantile: float | None = None,
     clip_bins: int = DEFAULT_CLIP_BINS,
 ) -> ExactFastPsResult | ExactFastMultiLabelPsResult | dict[str, Any]:
@@ -95,6 +96,8 @@ def run_ps_score_exact_fast(
     validate_layer(layer)
     assert clip_quantile is None or 0.0 < clip_quantile <= 1.0
     assert clip_bins >= 2 and type(clip_bins) == int
+    if logfc_threshold is not None and logfc_threshold < 0.0:
+        raise ValueError("logfc_threshold must be >= 0")
     if target_mode not in {"union_deg", "hvg"}:
         raise ValueError("target_mode must be 'union_deg' or 'hvg'")
     if mode not in {"single", "multilabel"}:
@@ -110,7 +113,8 @@ def run_ps_score_exact_fast(
     stage_start = time.perf_counter()
 
     full_stats_seconds = 0.0
-    full_stats: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+    full_stats: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None = None
+    linear_sums: np.ndarray | None = None
     if target_mode == "union_deg":
         stats_start = time.perf_counter()
         full_stats = _collect_group_stats(
@@ -119,9 +123,11 @@ def run_ps_score_exact_fast(
             control_mask=parsed.control_mask,
             chunk_size=chunk_size,
             target_sum=target_sum,
+            collect_linear_sums=logfc_threshold is not None,
         )
         full_stats_seconds = time.perf_counter() - stats_start
         counts = full_stats[2]
+        linear_sums = full_stats[3]
     else:
         counts = _group_counts(parsed.guides, parsed.control_mask)
     _check_group_counts(counts, parsed.perturbations)
@@ -135,6 +141,8 @@ def run_ps_score_exact_fast(
         full_stats=full_stats,
         target_gene_max=target_gene_max,
         rank_by_abs_t=rank_by_abs_t,
+        linear_sums=linear_sums,
+        logfc_threshold=logfc_threshold,
     )
     union_gene_indices = _ordered_union_indices(targets.values())
 
@@ -161,7 +169,7 @@ def run_ps_score_exact_fast(
             beta_sums = full_stats[0][:, union_gene_indices]
         else:
             clipped_stats_start = time.perf_counter()
-            beta_sums, _, counts = _collect_group_stats(
+            beta_sums, _, counts, _ = _collect_group_stats(
                 matrix,
                 guides=parsed.guides,
                 control_mask=parsed.control_mask,
@@ -248,6 +256,7 @@ def run_ps_score_exact_fast(
         "target_gene_source_detail": target_source,
         "target_gene_max": int(target_gene_max),
         "rank_by_abs_t": bool(rank_by_abs_t),
+        "logfc_threshold": None if logfc_threshold is None else float(logfc_threshold),
         "quantile_clip": clip_quantile is not None,
         "clip_quantile": None if clip_quantile is None else float(clip_quantile),
         "clip_method": None if clip_quantile is None else "streaming_histogram",
@@ -405,6 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--score-lambda", type=float, default=0.0)
     parser.add_argument("--scale-factor", type=float, default=3.0)
     parser.add_argument("--target-sum", type=float, default=DEFAULT_TARGET_SUM)
+    parser.add_argument("--logfc-threshold", type=float)
     parser.add_argument("--clip-quantile", type=float)
     parser.add_argument("--clip-bins", type=int, default=DEFAULT_CLIP_BINS)
     parser.add_argument("--perturbation", action="append", dest="perturbations")
@@ -432,6 +442,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         target_sum=args.target_sum,
         rank_by_abs_t=not args.rank_by_signed_t,
         scale_score=not args.no_scale_score,
+        logfc_threshold=args.logfc_threshold,
         clip_quantile=args.clip_quantile,
         clip_bins=args.clip_bins,
     )
@@ -531,20 +542,32 @@ def _select_target_genes(
     selected_perturbations: Sequence[str],
     var_names: np.ndarray,
     counts: np.ndarray,
-    full_stats: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    full_stats: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None,
     target_gene_max: int,
     rank_by_abs_t: bool,
+    linear_sums: np.ndarray | None,
+    logfc_threshold: float | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]], dict[str, Any]]:
     if target_mode == "hvg":
         hvg = _hvg_indices(adata)
         targets = {perturbation: hvg for perturbation in selected_perturbations}
         source = {"mode": "hvg", "var_column": "highly_variable"}
+        metadata = {
+            perturbation: {
+                "cell_count": int(counts[index + 1]),
+                "selected_gene_count": int(targets[perturbation].shape[0]),
+                "selected_genes": [str(var_names[gene_index]) for gene_index in targets[perturbation]],
+            }
+            for index, perturbation in enumerate(selected_perturbations)
+        }
     else:
         if full_stats is None:
             raise ValueError("union_deg target mode requires streamed full-gene group statistics")
-        sums, squared_sums, _ = full_stats
+        sums, squared_sums, _, _ = full_stats
         control_stats = StreamFeatureStats(count=int(counts[0]), sums=sums[0], squared_sums=squared_sums[0])
+        control_linear_mean = None if linear_sums is None else linear_sums[0] / max(int(counts[0]), 1)
         targets = {}
+        metadata = {}
         for perturbation_index, perturbation in enumerate(selected_perturbations, start=1):
             perturb_stats = StreamFeatureStats(
                 count=int(counts[perturbation_index]),
@@ -552,21 +575,44 @@ def _select_target_genes(
                 squared_sums=squared_sums[perturbation_index],
             )
             t_scores = welch_t_scores_from_stats(perturb_stats, control_stats)
-            targets[perturbation] = top_k_indices(
-                t_scores,
-                min(target_gene_max, t_scores.shape[0]),
-                absolute=rank_by_abs_t,
-            ).astype(np.int64, copy=False)
-        source = {"mode": "union_deg", "rank_by_abs_t": bool(rank_by_abs_t)}
+            logfc_passing = None
+            if logfc_threshold is not None:
+                if control_linear_mean is None or linear_sums is None:
+                    raise ValueError("logfc_threshold requires streamed normalized means")
+                perturb_linear_mean = linear_sums[perturbation_index] / max(int(counts[perturbation_index]), 1)
+                logfc = _log2_fold_change(perturb_linear_mean, control_linear_mean)
+                candidate_indices = np.flatnonzero(np.abs(logfc) > float(logfc_threshold)).astype(np.int64, copy=False)
+                logfc_passing = int(candidate_indices.shape[0])
+                if candidate_indices.size:
+                    ranked = top_k_indices(
+                        t_scores[candidate_indices],
+                        min(target_gene_max, candidate_indices.shape[0]),
+                        absolute=rank_by_abs_t,
+                    )
+                    targets[perturbation] = candidate_indices[ranked].astype(np.int64, copy=False)
+                else:
+                    targets[perturbation] = np.asarray([], dtype=np.int64)
+            else:
+                targets[perturbation] = top_k_indices(
+                    t_scores,
+                    min(target_gene_max, t_scores.shape[0]),
+                    absolute=rank_by_abs_t,
+                ).astype(np.int64, copy=False)
 
-    metadata = {
-        perturbation: {
-            "cell_count": int(counts[index + 1]),
-            "selected_gene_count": int(targets[perturbation].shape[0]),
-            "selected_genes": [str(var_names[gene_index]) for gene_index in targets[perturbation]],
+            metadata[perturbation] = {
+                "cell_count": int(counts[perturbation_index]),
+                "selected_gene_count": int(targets[perturbation].shape[0]),
+                "selected_genes": [str(var_names[gene_index]) for gene_index in targets[perturbation]],
+            }
+            if logfc_passing is not None:
+                metadata[perturbation]["logfc_filtered_gene_count"] = logfc_passing
+        source = {
+            "mode": "union_deg",
+            "rank_by_abs_t": bool(rank_by_abs_t),
+            "logfc_threshold": None if logfc_threshold is None else float(logfc_threshold),
+            "logfc_base": 2,
+            "logfc_pseudocount": 1.0,
         }
-        for index, perturbation in enumerate(selected_perturbations)
-    }
     return targets, metadata, source
 
 
@@ -603,10 +649,14 @@ def _iter_chunks(
     target_sum: float,
     gene_indices: np.ndarray | None = None,
     clip_values: np.ndarray | None = None,
+    apply_log1p: bool = True,
 ) -> Any:
     for start in range(0, n_obs, chunk_size):
         stop = min(start + chunk_size, n_obs)
-        chunk = _log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
+        if apply_log1p:
+            chunk = _log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
+        else:
+            chunk = _normalize_chunk(matrix[start:stop], target_sum=target_sum)
         if gene_indices is not None:
             chunk = chunk[:, gene_indices]
         if clip_values is not None:
@@ -623,11 +673,13 @@ def _collect_group_stats(
     target_sum: float,
     gene_indices: np.ndarray | None = None,
     clip_values: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    collect_linear_sums: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     feature_count = int(matrix.shape[1] if gene_indices is None else gene_indices.shape[0])
     group_count = guides.shape[1] + 1
     sums = np.zeros((group_count, feature_count), dtype=np.float64)
     squared_sums = np.zeros_like(sums)
+    linear_sums = np.zeros_like(sums) if collect_linear_sums else None
     counts = np.zeros(group_count, dtype=np.int64)
     for start, stop, chunk in _iter_chunks(
         matrix,
@@ -636,12 +688,18 @@ def _collect_group_stats(
         target_sum=target_sum,
         gene_indices=gene_indices,
         clip_values=clip_values,
+        apply_log1p=not collect_linear_sums,
     ):
         chunk_control = control_mask[start:stop]
+        if linear_sums is not None:
+            if np.any(chunk_control):
+                _add_group_sums(chunk[chunk_control], row=0, sums=linear_sums)
+            _add_multilabel_group_sums(chunk, guides[start:stop], sums=linear_sums)
+            chunk = _apply_log1p_chunk(chunk)
         if np.any(chunk_control):
             _add_group_stats(chunk[chunk_control], row=0, sums=sums, squared_sums=squared_sums, counts=counts)
         _add_multilabel_group_stats(chunk, guides[start:stop], sums=sums, squared_sums=squared_sums, counts=counts)
-    return sums, squared_sums, counts
+    return sums, squared_sums, counts, linear_sums
 
 
 def _score_single_label(
@@ -823,23 +881,33 @@ def _collect_multilabel_ridge_stats(
     return sparse.vstack([top, bottom], format="csc"), xty
 
 
-def _log_normalize_chunk(matrix: Any, *, target_sum: float) -> Any:
+def _normalize_chunk(matrix: Any, *, target_sum: float) -> Any:
     if sparse.issparse(matrix):
         work = matrix.tocsr(copy=True).astype(np.float64)
         totals = np.asarray(work.sum(axis=1)).ravel()
         scales = np.zeros(work.shape[0], dtype=np.float64)
         nonzero = totals > 0
         scales[nonzero] = target_sum / totals[nonzero]
-        work = work.multiply(scales[:, None]).tocsr()
-        work.data = np.log1p(work.data)
-        return work
+        return work.multiply(scales[:, None]).tocsr()
 
     dense = np.asarray(matrix, dtype=np.float64).copy()
     totals = dense.sum(axis=1, keepdims=True)
     nonzero = totals[:, 0] > 0
     dense[nonzero] *= target_sum / totals[nonzero]
     dense[~nonzero] = 0.0
-    return np.log1p(dense)
+    return dense
+
+
+def _log_normalize_chunk(matrix: Any, *, target_sum: float) -> Any:
+    return _apply_log1p_chunk(_normalize_chunk(matrix, target_sum=target_sum))
+
+
+def _apply_log1p_chunk(matrix: Any) -> Any:
+    if sparse.issparse(matrix):
+        matrix.data = np.log1p(matrix.data)
+        return matrix
+    np.log1p(matrix, out=matrix)
+    return matrix
 
 
 def _estimate_histogram_clip_values(
@@ -938,6 +1006,10 @@ def _add_group_stats(matrix: Any, *, row: int, sums: np.ndarray, squared_sums: n
     squared_sums[row] += np.square(dense).sum(axis=0)
 
 
+def _add_group_sums(matrix: Any, *, row: int, sums: np.ndarray) -> None:
+    sums[row] += _column_sums(matrix)
+
+
 def _add_multilabel_group_stats(matrix: Any, guides: sparse.csr_matrix, *, sums: np.ndarray, squared_sums: np.ndarray, counts: np.ndarray) -> None:
     coo = guides.tocoo()
     if coo.nnz == 0:
@@ -946,6 +1018,16 @@ def _add_multilabel_group_stats(matrix: Any, guides: sparse.csr_matrix, *, sums:
     rows = coo.row
     for column in np.unique(columns):
         _add_group_stats(matrix[rows[columns == column]], row=int(column) + 1, sums=sums, squared_sums=squared_sums, counts=counts)
+
+
+def _add_multilabel_group_sums(matrix: Any, guides: sparse.csr_matrix, *, sums: np.ndarray) -> None:
+    coo = guides.tocoo()
+    if coo.nnz == 0:
+        return
+    columns = coo.col
+    rows = coo.row
+    for column in np.unique(columns):
+        _add_group_sums(matrix[rows[columns == column]], row=int(column) + 1, sums=sums)
 
 
 def _add_multilabel_xty(matrix: Any, guides: sparse.csr_matrix, *, xty: np.ndarray) -> None:
@@ -962,6 +1044,10 @@ def _column_sums(matrix: Any) -> np.ndarray:
     if sparse.issparse(matrix):
         return np.asarray(matrix.sum(axis=0)).ravel().astype(np.float64, copy=False)
     return np.asarray(matrix, dtype=np.float64).sum(axis=0)
+
+
+def _log2_fold_change(case_mean: np.ndarray, control_mean: np.ndarray, *, pseudocount: float = 1.0) -> np.ndarray:
+    return np.log2((np.asarray(case_mean, dtype=np.float64) + pseudocount) / (np.asarray(control_mean, dtype=np.float64) + pseudocount))
 
 
 def _solve_single_label_ridge(

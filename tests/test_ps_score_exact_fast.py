@@ -8,7 +8,7 @@ from scipy import sparse
 from scipy.optimize import minimize
 
 from perturb_effects.ps_score_exact import run_ps_score_exact_anndata
-from perturb_effects.ps_score_exact_fast import main, run_ps_score_exact_fast
+from perturb_effects.ps_score_exact_fast import _select_target_genes, main, run_ps_score_exact_fast
 
 
 def test_exact_fast_histogram_clip_matches_dense_exact_clip() -> None:
@@ -199,6 +199,59 @@ def test_selected_perturbations_fail_loudly_when_missing() -> None:
             perturbations=["pertB"],
             target_mode="hvg",
         )
+
+
+def test_union_deg_logfc_threshold_filters_low_logfc_genes() -> None:
+    counts = np.array([20, 20], dtype=np.int64)
+    control_log = np.array(
+        [
+            [0.00, 0.00, 0.00],
+            [0.05, 0.05, 0.05],
+            [0.00, 0.00, 0.00],
+            [0.05, 0.05, 0.05],
+        ],
+        dtype=np.float64,
+    )
+    pert_log = np.array(
+        [
+            [0.40, 0.08, 0.25],
+            [0.45, 0.09, 0.30],
+            [0.40, 0.08, 0.25],
+            [0.45, 0.09, 0.30],
+        ],
+        dtype=np.float64,
+    )
+    full_stats = (
+        np.vstack([control_log.sum(axis=0), pert_log.sum(axis=0)]),
+        np.vstack([np.square(control_log).sum(axis=0), np.square(pert_log).sum(axis=0)]),
+        counts,
+        None,
+    )
+    linear_sums = np.array(
+        [
+            [20.0, 20.0, 20.0],
+            [40.0, 21.0, 32.0],
+        ],
+        dtype=np.float64,
+    )
+
+    targets, metadata, source = _select_target_genes(
+        adata=None,
+        target_mode="union_deg",
+        selected_perturbations=["pertA"],
+        var_names=np.asarray(["g1", "g2", "g3"], dtype=object),
+        counts=counts,
+        full_stats=full_stats,
+        target_gene_max=3,
+        rank_by_abs_t=True,
+        linear_sums=linear_sums,
+        logfc_threshold=0.1,
+    )
+
+    assert targets["pertA"].tolist() == [0, 2]
+    assert metadata["pertA"]["logfc_filtered_gene_count"] == 2
+    assert metadata["pertA"]["selected_genes"] == ["g1", "g3"]
+    assert source["logfc_threshold"] == 0.1
 
 
 def test_single_output_csv_marks_controls_and_unselected_cells(tmp_path) -> None:
