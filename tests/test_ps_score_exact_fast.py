@@ -254,6 +254,131 @@ def test_union_deg_logfc_threshold_filters_low_logfc_genes() -> None:
     assert source["logfc_threshold"] == 0.1
 
 
+def test_single_background_correction_uses_cluster_control_baseline() -> None:
+    counts = np.asarray(
+        [
+            [9.0, 1.0],
+            [8.0, 2.0],
+            [2.0, 8.0],
+            [1.0, 9.0],
+            [9.0, 1.0],
+            [4.0, 6.0],
+        ],
+        dtype=np.float64,
+    )
+    labels = np.asarray(["control", "control", "control", "control", "pertA", "pertA"], dtype=object)
+    clusters = np.asarray(["c1", "c1", "c2", "c2", "c1", "c2"], dtype=object)
+    adata = AnnData(
+        X=sparse.csr_matrix(counts),
+        obs=pd.DataFrame({"perturbation": labels, "cluster": clusters}, index=[f"cell_{index}" for index in range(counts.shape[0])]),
+        var=pd.DataFrame({"highly_variable": [True, True]}, index=["g1", "g2"]),
+    )
+
+    result = run_ps_score_exact_fast(
+        adata,
+        mode="single",
+        perturb_column="perturbation",
+        ctrl_name="control",
+        perturbations=["pertA"],
+        target_mode="hvg",
+        background_cluster_column="cluster",
+        chunk_size=2,
+        lr_lambda=0.0,
+        score_lambda=0.0,
+        scale_factor=10.0,
+        target_sum=100.0,
+        scale_score=False,
+    )
+
+    lognorm = np.log1p(counts / counts.sum(axis=1, keepdims=True) * 100.0)
+    cluster_codes = np.asarray([0, 0, 1, 1, 0, 1], dtype=np.int64)
+    background = np.vstack([lognorm[(labels == "control") & (clusters == "c1")].mean(axis=0), lognorm[(labels == "control") & (clusters == "c2")].mean(axis=0)])
+    perturb_rows = labels == "pertA"
+    corrected = lognorm[perturb_rows] - background[cluster_codes[perturb_rows]]
+    expected_beta = corrected.mean(axis=0)
+    expected_raw = corrected @ expected_beta / float(expected_beta @ expected_beta)
+
+    assert result.metadata["background_correction"] is True
+    assert result.metadata["background_control_cell_counts"] == {"c1": 2, "c2": 2}
+    assert np.allclose(result.beta[0], 0.0)
+    assert np.allclose(result.beta[1], expected_beta)
+    assert np.allclose(result.scores[perturb_rows, 0] * 10.0, np.clip(expected_raw, 0.0, 10.0))
+
+
+def test_multilabel_background_correction_matches_corrected_quadratic() -> None:
+    counts = np.asarray(
+        [
+            [9.0, 1.0, 1.0],
+            [8.0, 2.0, 1.0],
+            [1.0, 8.0, 1.0],
+            [2.0, 7.0, 1.0],
+            [12.0, 1.0, 1.0],
+            [1.0, 12.0, 1.0],
+            [4.0, 10.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    labels = np.asarray(["control", "control", "control", "control", "pertA", "pertB", "pertA+pertB"], dtype=object)
+    clusters = np.asarray(["c1", "c1", "c2", "c2", "c1", "c2", "c2"], dtype=object)
+    adata = AnnData(
+        X=sparse.csr_matrix(counts),
+        obs=pd.DataFrame({"perturbation": labels, "cluster": clusters}, index=[f"cell_{index}" for index in range(counts.shape[0])]),
+        var=pd.DataFrame({"highly_variable": [True, True, True]}, index=["g1", "g2", "g3"]),
+    )
+
+    result = run_ps_score_exact_fast(
+        adata,
+        mode="multilabel",
+        perturb_column="perturbation",
+        ctrl_name="control",
+        target_mode="hvg",
+        background_cluster_column="cluster",
+        chunk_size=3,
+        lr_lambda=0.0,
+        score_lambda=0.0,
+        scale_factor=10.0,
+        target_sum=100.0,
+        scale_score=False,
+    )
+
+    lognorm = np.log1p(counts / counts.sum(axis=1, keepdims=True) * 100.0)
+    background = np.vstack([lognorm[(labels == "control") & (clusters == "c1")].mean(axis=0), lognorm[(labels == "control") & (clusters == "c2")].mean(axis=0)])
+    active_rows = np.asarray([4, 5, 6], dtype=np.int64)
+    active_clusters = np.asarray([0, 1, 1], dtype=np.int64)
+    design = np.asarray([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64)
+    corrected = lognorm[active_rows] - background[active_clusters]
+    expected_beta = np.linalg.solve(design.T @ design, design.T @ corrected)
+
+    assert np.allclose(result.beta[0], 0.0)
+    assert np.allclose(result.beta[1:], expected_beta)
+
+    combo_row = 6
+    observed = {
+        result.perturbations[int(perturbation)]: float(score) * 10.0
+        for cell, perturbation, score in zip(result.cell_indices, result.perturbation_indices, result.scores, strict=False)
+        if int(cell) == combo_row
+    }
+    z = lognorm[combo_row] - background[1]
+    gram = expected_beta @ expected_beta.T
+    rhs = z @ expected_beta.T
+
+    def objective(value: np.ndarray) -> float:
+        return float(0.5 * value @ gram @ value - rhs @ value)
+
+    def gradient(value: np.ndarray) -> np.ndarray:
+        return gram @ value - rhs
+
+    expected = minimize(
+        objective,
+        np.zeros(2, dtype=np.float64),
+        jac=gradient,
+        bounds=[(0.0, 10.0), (0.0, 10.0)],
+        method="L-BFGS-B",
+    ).x
+    assert set(observed) == {"pertA", "pertB"}
+    assert np.allclose([observed["pertA"], observed["pertB"]], expected, atol=1e-6)
+
+
 def test_single_output_csv_marks_controls_and_unselected_cells(tmp_path) -> None:
     counts = np.asarray(
         [

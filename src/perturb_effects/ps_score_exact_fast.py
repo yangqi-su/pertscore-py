@@ -69,6 +69,13 @@ class _ParsedPerturbations:
     active_counts: np.ndarray
 
 
+@dataclass
+class _BackgroundStats:
+    control_sums: np.ndarray
+    control_counts: np.ndarray
+    perturbation_cluster_counts: np.ndarray
+
+
 def run_ps_score_exact_fast(
     data: Any,
     *,
@@ -88,6 +95,7 @@ def run_ps_score_exact_fast(
     rank_by_abs_t: bool = True,
     scale_score: bool = True,
     logfc_threshold: float | None = 0.1,
+    background_cluster_column: str | None = None,
     clip_quantile: float | None = None,
     clip_bins: int = DEFAULT_CLIP_BINS,
 ) -> ExactFastPsResult | ExactFastMultiLabelPsResult | dict[str, Any]:
@@ -110,6 +118,7 @@ def run_ps_score_exact_fast(
     matrix = extract_anndata_matrix(adata, layer=layer)
     parsed = _parse_perturbations(labels, mode=mode, ctrl_name=ctrl_name, perturbations=perturbations)
     var_names = np.asarray(adata.var_names, dtype=object)
+    background_cluster_codes, background_cluster_names = _background_cluster_codes(adata, background_cluster_column)
     stage_start = time.perf_counter()
 
     full_stats_seconds = 0.0
@@ -145,6 +154,7 @@ def run_ps_score_exact_fast(
         logfc_threshold=logfc_threshold,
     )
     union_gene_indices = _ordered_union_indices(targets.values())
+    background_enabled = background_cluster_codes is not None
 
     clip_values = None
     clip_threshold_seconds = 0.0
@@ -164,8 +174,14 @@ def run_ps_score_exact_fast(
 
     clipped_stats_seconds = 0.0
     ridge_stats_seconds = 0.0
+    background_control_counts: np.ndarray | None = None
     if mode == "single":
-        if clip_values is None and full_stats is not None:
+        background_stats = _new_background_stats(
+            cluster_count=len(background_cluster_names),
+            perturbation_count=parsed.guides.shape[1],
+            feature_count=union_gene_indices.shape[0],
+        ) if background_enabled else None
+        if clip_values is None and full_stats is not None and background_stats is None:
             beta_sums = full_stats[0][:, union_gene_indices]
         else:
             clipped_stats_start = time.perf_counter()
@@ -177,16 +193,35 @@ def run_ps_score_exact_fast(
                 clip_values=clip_values,
                 chunk_size=chunk_size,
                 target_sum=target_sum,
+                cluster_codes=background_cluster_codes,
+                background_stats=background_stats,
             )
             clipped_stats_seconds = time.perf_counter() - clipped_stats_start
         ridge_start = time.perf_counter()
-        beta = _solve_single_label_ridge(
-            total_rhs=beta_sums.sum(axis=0),
-            perturbation_rhs=beta_sums[1:],
-            perturbation_counts=counts[1:].astype(np.float64, copy=False),
-            model_cell_count=float(counts.sum()),
-            lr_lambda=float(lr_lambda),
-        )
+        background_projection = None
+        if background_stats is not None:
+            cluster_background = _cluster_background_matrix(
+                background_stats,
+                cluster_names=background_cluster_names,
+                needed_clusters=np.unique(background_cluster_codes[parsed.model_mask]),
+            )
+            background_control_counts = background_stats.control_counts
+            beta = _solve_single_label_background_ridge(
+                perturbation_rhs=beta_sums[1:],
+                perturbation_counts=counts[1:].astype(np.float64, copy=False),
+                perturbation_cluster_counts=background_stats.perturbation_cluster_counts,
+                cluster_background=cluster_background,
+                lr_lambda=float(lr_lambda),
+            )
+            background_projection = cluster_background @ beta[1:].T
+        else:
+            beta = _solve_single_label_ridge(
+                total_rhs=beta_sums.sum(axis=0),
+                perturbation_rhs=beta_sums[1:],
+                perturbation_counts=counts[1:].astype(np.float64, copy=False),
+                model_cell_count=float(counts.sum()),
+                lr_lambda=float(lr_lambda),
+            )
         ridge_seconds = time.perf_counter() - ridge_start
         scores, valid_mask, max_score_by_perturbation, scoring_seconds = _score_single_label(
             matrix,
@@ -199,8 +234,15 @@ def run_ps_score_exact_fast(
             score_lambda=score_lambda,
             scale_factor=scale_factor,
             scale_score=scale_score,
+            cluster_codes=background_cluster_codes,
+            background_projection=background_projection,
         )
     else:
+        background_stats = _new_background_stats(
+            cluster_count=len(background_cluster_names),
+            perturbation_count=parsed.guides.shape[1],
+            feature_count=union_gene_indices.shape[0],
+        ) if background_enabled else None
         ridge_stats_start = time.perf_counter()
         xtx, xty = _collect_multilabel_ridge_stats(
             matrix,
@@ -210,12 +252,33 @@ def run_ps_score_exact_fast(
             clip_values=clip_values,
             chunk_size=chunk_size,
             target_sum=target_sum,
+            cluster_codes=background_cluster_codes,
+            background_stats=background_stats,
         )
         ridge_stats_seconds = time.perf_counter() - ridge_stats_start
         ridge_start = time.perf_counter()
-        beta = np.asarray(spsolve(xtx + sparse.eye(xtx.shape[0], format="csc") * float(lr_lambda), xty), dtype=np.float64)
-        if beta.ndim == 1:
-            beta = beta[:, None]
+        background_projection = None
+        if background_stats is not None:
+            cluster_background = _cluster_background_matrix(
+                background_stats,
+                cluster_names=background_cluster_names,
+                needed_clusters=np.unique(background_cluster_codes[parsed.model_mask]),
+            )
+            background_control_counts = background_stats.control_counts
+            corrected_xty = xty[1:] - background_stats.perturbation_cluster_counts @ cluster_background
+            perturbation_xtx = xtx[1:, 1:].tocsc()
+            perturbation_beta = np.asarray(
+                spsolve(perturbation_xtx + sparse.eye(perturbation_xtx.shape[0], format="csc") * float(lr_lambda), corrected_xty),
+                dtype=np.float64,
+            )
+            if perturbation_beta.ndim == 1:
+                perturbation_beta = perturbation_beta[:, None]
+            beta = np.vstack([np.zeros((1, corrected_xty.shape[1]), dtype=np.float64), perturbation_beta])
+            background_projection = cluster_background @ beta[1:].T
+        else:
+            beta = np.asarray(spsolve(xtx + sparse.eye(xtx.shape[0], format="csc") * float(lr_lambda), xty), dtype=np.float64)
+            if beta.ndim == 1:
+                beta = beta[:, None]
         ridge_seconds = time.perf_counter() - ridge_start
         (
             scores,
@@ -235,6 +298,8 @@ def run_ps_score_exact_fast(
             score_lambda=score_lambda,
             scale_factor=scale_factor,
             scale_score=scale_score,
+            cluster_codes=background_cluster_codes,
+            background_projection=background_projection,
         )
 
     _add_score_metadata(
@@ -257,6 +322,8 @@ def run_ps_score_exact_fast(
         "target_gene_max": int(target_gene_max),
         "rank_by_abs_t": bool(rank_by_abs_t),
         "logfc_threshold": None if logfc_threshold is None else float(logfc_threshold),
+        "background_correction": bool(background_enabled),
+        "background_cluster_column": background_cluster_column,
         "quantile_clip": clip_quantile is not None,
         "clip_quantile": None if clip_quantile is None else float(clip_quantile),
         "clip_method": None if clip_quantile is None else "streaming_histogram",
@@ -286,6 +353,9 @@ def run_ps_score_exact_fast(
         },
         "max_rss_kb": _max_rss_kb(),
     }
+    if background_enabled and background_control_counts is not None:
+        metadata["background_cluster_count"] = int(len(background_cluster_names))
+        metadata["background_control_cell_counts"] = {name: int(background_control_counts[index]) for index, name in enumerate(background_cluster_names)}
     if mode == "single":
         metadata["score_vector_shape"] = (int(labels.shape[0]), 1)
         result = ExactFastPsResult(
@@ -415,6 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scale-factor", type=float, default=3.0)
     parser.add_argument("--target-sum", type=float, default=DEFAULT_TARGET_SUM)
     parser.add_argument("--logfc-threshold", type=float)
+    parser.add_argument("--background-cluster-column")
     parser.add_argument("--clip-quantile", type=float)
     parser.add_argument("--clip-bins", type=int, default=DEFAULT_CLIP_BINS)
     parser.add_argument("--perturbation", action="append", dest="perturbations")
@@ -443,6 +514,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         rank_by_abs_t=not args.rank_by_signed_t,
         scale_score=not args.no_scale_score,
         logfc_threshold=args.logfc_threshold,
+        background_cluster_column=args.background_cluster_column,
         clip_quantile=args.clip_quantile,
         clip_bins=args.clip_bins,
     )
@@ -459,6 +531,23 @@ def _clean_obs_labels(adata: Any, perturb_column: str) -> np.ndarray:
             raise ValueError(f"Empty perturbation label at obs row {row_index}")
         labels.append(label)
     return np.asarray(labels, dtype=object)
+
+
+def _background_cluster_codes(adata: Any, cluster_column: str | None) -> tuple[np.ndarray | None, list[str]]:
+    if cluster_column is None:
+        return None, []
+    raw = np.asarray(get_obs_column(adata.obs, cluster_column), dtype=object)
+    labels: list[str] = []
+    for row_index, value in enumerate(raw):
+        if pd.isna(value):
+            raise ValueError(f"Missing background cluster label at obs row {row_index}")
+        label = str(value)
+        if not label:
+            raise ValueError(f"Empty background cluster label at obs row {row_index}")
+        labels.append(label)
+    cluster_names = _ordered_unique(labels)
+    lookup = {cluster: index for index, cluster in enumerate(cluster_names)}
+    return np.asarray([lookup[label] for label in labels], dtype=np.int32), cluster_names
 
 
 def _parse_perturbations(
@@ -674,6 +763,8 @@ def _collect_group_stats(
     gene_indices: np.ndarray | None = None,
     clip_values: np.ndarray | None = None,
     collect_linear_sums: bool = False,
+    cluster_codes: np.ndarray | None = None,
+    background_stats: _BackgroundStats | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     feature_count = int(matrix.shape[1] if gene_indices is None else gene_indices.shape[0])
     group_count = guides.shape[1] + 1
@@ -696,6 +787,10 @@ def _collect_group_stats(
                 _add_group_sums(chunk[chunk_control], row=0, sums=linear_sums)
             _add_multilabel_group_sums(chunk, guides[start:stop], sums=linear_sums)
             chunk = _apply_log1p_chunk(chunk)
+        if background_stats is not None:
+            if cluster_codes is None:
+                raise ValueError("background_stats requires cluster_codes")
+            _add_background_stats(chunk, guides[start:stop], chunk_control, cluster_codes[start:stop], background_stats)
         if np.any(chunk_control):
             _add_group_stats(chunk[chunk_control], row=0, sums=sums, squared_sums=squared_sums, counts=counts)
         _add_multilabel_group_stats(chunk, guides[start:stop], sums=sums, squared_sums=squared_sums, counts=counts)
@@ -714,9 +809,11 @@ def _score_single_label(
     score_lambda: float,
     scale_factor: float,
     scale_score: bool,
+    cluster_codes: np.ndarray | None = None,
+    background_projection: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     beta_norm_sq = np.einsum("ij,ij->i", beta[1:], beta[1:])
-    baseline_projection = beta[1:] @ beta[0]
+    baseline_projection = None if background_projection is not None else beta[1:] @ beta[0]
     codes = _single_codes_from_guides(guides)
     scores = np.zeros((guides.shape[0], 1), dtype=np.float32)
     valid_mask = np.zeros(guides.shape[0], dtype=bool)
@@ -732,6 +829,7 @@ def _score_single_label(
         clip_values=clip_values,
     ):
         chunk_codes = codes[start:stop]
+        chunk_cluster_codes = None if cluster_codes is None else cluster_codes[start:stop]
         row_indices = np.arange(start, stop, dtype=np.int64)
         for code in np.unique(chunk_codes):
             if code < 0:
@@ -741,7 +839,12 @@ def _score_single_label(
                 continue
             mask = chunk_codes == code
             projected = np.asarray(chunk[mask] @ beta[int(code) + 1], dtype=np.float64).ravel()
-            raw = (projected - baseline_projection[int(code)] - score_lambda) / denominator
+            if background_projection is None:
+                raw = (projected - baseline_projection[int(code)] - score_lambda) / denominator
+            else:
+                if chunk_cluster_codes is None:
+                    raise ValueError("background_projection requires cluster_codes")
+                raw = (projected - background_projection[chunk_cluster_codes[mask], int(code)] - score_lambda) / denominator
             clipped = np.clip(raw, 0.0, scale_factor) / scale_factor
             selected_rows = row_indices[mask]
             scores[selected_rows, 0] = clipped.astype(np.float32, copy=False)
@@ -780,6 +883,8 @@ def _score_multilabel(
     score_lambda: float,
     scale_factor: float,
     scale_score: bool,
+    cluster_codes: np.ndarray | None = None,
+    background_projection: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     score_values: list[np.ndarray] = []
     cell_index_values: list[np.ndarray] = []
@@ -797,11 +902,18 @@ def _score_multilabel(
         clip_values=clip_values,
     ):
         row_indices = np.arange(start, stop, dtype=np.int64)
+        chunk_cluster_codes = None if cluster_codes is None else cluster_codes[start:stop]
         for active_set, local_rows in _group_rows_by_active_set(guides[start:stop]).items():
             active_indices = np.asarray(active_set, dtype=np.int64)
             active_beta = beta[active_indices + 1]
             gram = active_beta @ active_beta.T
-            rhs = np.asarray(chunk[local_rows] @ active_beta.T, dtype=np.float64) - (active_beta @ beta[0])[None, :]
+            rhs = np.asarray(chunk[local_rows] @ active_beta.T, dtype=np.float64)
+            if background_projection is None:
+                rhs -= (active_beta @ beta[0])[None, :]
+            else:
+                if chunk_cluster_codes is None:
+                    raise ValueError("background_projection requires cluster_codes")
+                rhs -= background_projection[chunk_cluster_codes[local_rows]][:, active_indices]
             bounded = _solve_bounded_quadratic_scores(
                 gram=gram,
                 rhs=rhs,
@@ -845,6 +957,8 @@ def _collect_multilabel_ridge_stats(
     clip_values: np.ndarray | None,
     chunk_size: int,
     target_sum: float,
+    cluster_codes: np.ndarray | None = None,
+    background_stats: _BackgroundStats | None = None,
 ) -> tuple[sparse.csc_matrix, np.ndarray]:
     perturbation_count = guides.shape[1]
     xty = np.zeros((perturbation_count + 1, union_gene_indices.shape[0]), dtype=np.float64)
@@ -861,6 +975,10 @@ def _collect_multilabel_ridge_stats(
         clip_values=clip_values,
     ):
         chunk_guides = guides[start:stop]
+        if background_stats is not None:
+            if cluster_codes is None:
+                raise ValueError("background_stats requires cluster_codes")
+            _add_background_stats(chunk, chunk_guides, control_mask[start:stop], cluster_codes[start:stop], background_stats)
         active = np.asarray(chunk_guides.getnnz(axis=1)).ravel() > 0
         model_mask = control_mask[start:stop] | active
         if not np.any(model_mask):
@@ -1030,6 +1148,42 @@ def _add_multilabel_group_sums(matrix: Any, guides: sparse.csr_matrix, *, sums: 
         _add_group_sums(matrix[rows[columns == column]], row=int(column) + 1, sums=sums)
 
 
+def _new_background_stats(*, cluster_count: int, perturbation_count: int, feature_count: int) -> _BackgroundStats:
+    return _BackgroundStats(
+        control_sums=np.zeros((cluster_count, feature_count), dtype=np.float64),
+        control_counts=np.zeros(cluster_count, dtype=np.int64),
+        perturbation_cluster_counts=np.zeros((perturbation_count, cluster_count), dtype=np.float64),
+    )
+
+
+def _add_background_stats(
+    matrix: Any,
+    guides: sparse.csr_matrix,
+    control_mask: np.ndarray,
+    cluster_codes: np.ndarray,
+    stats: _BackgroundStats,
+) -> None:
+    if np.any(control_mask):
+        control_clusters = cluster_codes[control_mask]
+        np.add.at(stats.control_counts, control_clusters, 1)
+        for cluster in np.unique(control_clusters):
+            rows = control_mask & (cluster_codes == cluster)
+            _add_group_sums(matrix[rows], row=int(cluster), sums=stats.control_sums)
+    coo = guides.tocoo()
+    if coo.nnz:
+        np.add.at(stats.perturbation_cluster_counts, (coo.col, cluster_codes[coo.row]), 1.0)
+
+
+def _cluster_background_matrix(stats: _BackgroundStats, *, cluster_names: Sequence[str], needed_clusters: np.ndarray) -> np.ndarray:
+    missing = [cluster_names[int(cluster)] for cluster in needed_clusters if stats.control_counts[int(cluster)] == 0]
+    if missing:
+        raise ValueError("background correction requires control cells in each modeled cluster: " + ", ".join(missing))
+    background = np.zeros_like(stats.control_sums)
+    nonzero = stats.control_counts > 0
+    background[nonzero] = stats.control_sums[nonzero] / stats.control_counts[nonzero, None]
+    return background
+
+
 def _add_multilabel_xty(matrix: Any, guides: sparse.csr_matrix, *, xty: np.ndarray) -> None:
     coo = guides.tocoo()
     if coo.nnz == 0:
@@ -1064,6 +1218,19 @@ def _solve_single_label_ridge(
     beta0 = (total_rhs - weighted_rhs) / intercept_denominator
     perturbation_beta = (perturbation_rhs - perturbation_counts[:, None] * beta0[None, :]) / perturbation_denominator[:, None]
     return np.vstack([beta0[None, :], perturbation_beta])
+
+
+def _solve_single_label_background_ridge(
+    *,
+    perturbation_rhs: np.ndarray,
+    perturbation_counts: np.ndarray,
+    perturbation_cluster_counts: np.ndarray,
+    cluster_background: np.ndarray,
+    lr_lambda: float,
+) -> np.ndarray:
+    corrected_rhs = perturbation_rhs - perturbation_cluster_counts @ cluster_background
+    perturbation_beta = corrected_rhs / (perturbation_counts + lr_lambda)[:, None]
+    return np.vstack([np.zeros((1, corrected_rhs.shape[1]), dtype=np.float64), perturbation_beta])
 
 
 def _group_rows_by_active_set(guides: sparse.csr_matrix) -> dict[tuple[int, ...], np.ndarray]:
