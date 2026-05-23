@@ -13,20 +13,9 @@ from scipy.special import expit, logsumexp
 from scipy.spatial.distance import cdist
 
 from .parallel import normalize_n_jobs, run_parallel_tasks
-from .stats import (
-    csr_batch_to_matrix,
-    extract_anndata_matrix,
-    get_obs_column,
-    get_obs_row_ids,
-    iter_csr_batches,
-    require_reiterable_batches,
-    resolve_perturbations,
-    validate_fidelity,
-    validate_layer,
-    validate_perturbations,
-    welch_t_scores,
-    welch_t_scores_from_stats,
-)
+from .stats import welch_t_scores, welch_t_scores_from_stats
+from .stream import extract_anndata_matrix
+from .utils import resolve_perturbations
 
 
 RESULT_COLUMNS = [
@@ -80,10 +69,8 @@ def run_mixscape_anndata(
     if not isinstance(control_label, str) or not control_label:
         raise ValueError("control_label must be a non-empty string")
 
-    validate_layer(layer)
-    validate_layer(de_layer)
-    fidelity = validate_fidelity(fidelity)
-    validate_perturbations(perturbations)
+    if fidelity not in {"exact", "approx"}:
+        raise ValueError(f"Unsupported fidelity {fidelity!r}")
     normalize_n_jobs(n_jobs)
     _validate_positive_int("n_neighbors", n_neighbors)
     _validate_positive_int("min_de_genes", min_de_genes)
@@ -95,7 +82,7 @@ def run_mixscape_anndata(
     if not hasattr(adata, "obs") or not hasattr(adata, "obs_names") or not hasattr(adata, "var_names"):
         raise TypeError("adata must provide obs, obs_names, and var_names")
 
-    labels = np.asarray(get_obs_column(adata.obs, perturbation_key), dtype=object)
+    labels = np.asarray(adata.obs[perturbation_key], dtype=object)
     if labels.size == 0:
         raise ValueError("adata must contain at least one observation")
     if not np.any(labels == control_label):
@@ -196,8 +183,8 @@ def run_mixscape_stream(
         raise ValueError("perturbation_key must be a non-empty string")
     if not isinstance(control_label, str) or not control_label:
         raise ValueError("control_label must be a non-empty string")
-    fidelity = validate_fidelity(fidelity)
-    validate_perturbations(perturbations)
+    if fidelity not in {"exact", "approx"}:
+        raise ValueError(f"Unsupported fidelity {fidelity!r}")
     normalize_n_jobs(n_jobs)
     _validate_positive_int("n_neighbors", n_neighbors)
     _validate_positive_int("min_de_genes", min_de_genes)
@@ -206,8 +193,8 @@ def run_mixscape_stream(
     _validate_optional_positive_int("control_sample_size", control_sample_size)
     _validate_optional_positive_int("perturbation_sample_size", perturbation_sample_size)
 
-    labels = np.asarray(get_obs_column(obs, perturbation_key), dtype=object)
-    row_ids = np.asarray(get_obs_row_ids(obs), dtype=object)
+    labels = np.asarray(obs[perturbation_key], dtype=object)
+    row_ids = np.asarray(obs.index, dtype=object)
     if labels.size == 0:
         raise ValueError("obs must contain at least one observation")
     if row_ids.shape[0] != labels.shape[0]:
@@ -238,10 +225,9 @@ def run_mixscape_stream(
     base_seed = 0 if random_state is None else int(random_state)
 
     if fidelity == "exact":
-        batch_factory = require_reiterable_batches(
-            batches,
-            operation="run_mixscape_stream exact mode",
-        )
+        if not callable(batches):
+            raise ValueError("run_mixscape_stream exact mode requires a callable batch factory")
+        batch_factory = batches
         worker = lambda perturbation: _run_stream_exact_for_perturbation(
             batches=batch_factory,
             perturbation=perturbation,
@@ -851,6 +837,21 @@ def _batch_labels(batch_row_ids: Sequence[Any], label_by_row_id: dict[Any, Any])
     return np.asarray(labels, dtype=object)
 
 
+def _batch_source(batches: Any) -> Any:
+    return batches() if callable(batches) else batches
+
+
+def _batch_matrix(batch: Any) -> sparse.csr_matrix:
+    return sparse.csr_matrix(
+        (
+            np.asarray(batch.data, dtype=float),
+            np.asarray(batch.indices, dtype=np.int64),
+            np.asarray(batch.indptr, dtype=np.int64),
+        ),
+        shape=batch.shape,
+    )
+
+
 def _collect_stream_feature_stats(
     *,
     batches: Any,
@@ -866,9 +867,9 @@ def _collect_stream_feature_stats(
     control_squared = np.zeros(n_features, dtype=float)
     target_squared = np.zeros(n_features, dtype=float)
 
-    for batch in iter_csr_batches(batches):
+    for batch in _batch_source(batches):
         _validate_stream_feature_count(batch.shape[1], n_features)
-        matrix = csr_batch_to_matrix(batch)
+        matrix = _batch_matrix(batch)
         labels = _batch_labels(batch.row_ids, label_by_row_id)
         control_mask = labels == control_label
         target_mask = labels == perturbation
@@ -906,9 +907,9 @@ def _collect_stream_rows_for_perturbation(
     combined_labels: list[np.ndarray] = []
     control_row_ids: list[np.ndarray] = []
 
-    for batch in iter_csr_batches(batches):
+    for batch in _batch_source(batches):
         _validate_stream_feature_count(batch.shape[1], n_features)
-        matrix = csr_batch_to_matrix(batch)
+        matrix = _batch_matrix(batch)
         labels = _batch_labels(batch.row_ids, label_by_row_id)
         row_ids = np.asarray(batch.row_ids, dtype=object)
         control_mask = labels == control_label
@@ -953,9 +954,9 @@ def _buffer_stream_rows(
     target_parts: dict[Any, list[sparse.csr_matrix]] = {perturbation: [] for perturbation in selected}
     target_row_ids: dict[Any, list[np.ndarray]] = {perturbation: [] for perturbation in selected}
 
-    for batch in iter_csr_batches(batches):
+    for batch in _batch_source(batches):
         _validate_stream_feature_count(batch.shape[1], n_features)
-        matrix = csr_batch_to_matrix(batch)
+        matrix = _batch_matrix(batch)
         labels = _batch_labels(batch.row_ids, label_by_row_id)
         row_ids = np.asarray(batch.row_ids, dtype=object)
 

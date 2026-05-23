@@ -278,49 +278,6 @@ def test_scale_score_normalizes_by_column_max_after_scale_factor_division() -> N
     assert np.isclose(scaled_scores.loc["pert-a-2"], 1.0)
 
 
-def test_lsq_linear_score_solver_matches_closed_form_scores() -> None:
-    adata = _make_single_perturbation_adata()
-
-    closed_form = run_ps_score_exact_anndata(
-        adata,
-        perturb_column="perturbation",
-        ctrl_name="control",
-        layer="expr",
-        target_genes=["g1", "g2"],
-        target_gene_source="provided",
-        target_gene_min=1,
-        target_gene_max=5,
-        apply_gene_filter=False,
-        apply_quantile_clip=False,
-        lr_lambda=0.0,
-        score_lambda=0.1,
-        scale_factor=1.5,
-        scale_score=False,
-        score_solver="closed_form",
-    )
-    lsq = run_ps_score_exact_anndata(
-        adata,
-        perturb_column="perturbation",
-        ctrl_name="control",
-        layer="expr",
-        target_genes=["g1", "g2"],
-        target_gene_source="provided",
-        target_gene_min=1,
-        target_gene_max=5,
-        apply_gene_filter=False,
-        apply_quantile_clip=False,
-        lr_lambda=0.0,
-        score_lambda=0.1,
-        scale_factor=1.5,
-        scale_score=False,
-        score_solver="lsq_linear",
-    )
-
-    assert np.allclose(closed_form["ps_score"], lsq["ps_score"])
-    assert lsq.attrs["ps_score_exact"]["score_solver"] == "lsq_linear"
-    assert lsq.attrs["ps_score_exact"]["score_metadata"]["pertA"]["score_solver"] == "lsq_linear"
-
-
 def test_provided_target_gene_mapping_deduplicates_and_truncates_by_max() -> None:
     adata = _make_target_strategy_adata()
 
@@ -544,7 +501,6 @@ def test_sparse_closed_form_matches_dense_outputs_and_selects_sparse_path() -> N
     assert sparse_metadata["genes_by_perturbation"] == dense_metadata["genes_by_perturbation"]
     assert sparse_metadata["score_metadata"].keys() == dense_metadata["score_metadata"].keys()
     for perturbation in sparse_metadata["score_metadata"]:
-        assert sparse_metadata["score_metadata"][perturbation]["score_solver"] == "closed_form"
         assert sparse_metadata["score_metadata"][perturbation]["control_count"] == dense_metadata[
             "score_metadata"
         ][perturbation]["control_count"]

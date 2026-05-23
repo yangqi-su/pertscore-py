@@ -44,7 +44,6 @@ class ExactPsBenchmarkConfig:
     score_lambda: float = 0.0
     scale_factor: float = 3.0
     scale_score: bool = True
-    score_solver: str = "closed_form"
     pilot_perturbation_count: int = 50
     min_cells_per_perturbation: int = 2
     random_seed: int = 0
@@ -97,7 +96,6 @@ class ExactPsBenchmarkConfig:
             "score_lambda": self.score_lambda,
             "scale_factor": self.scale_factor,
             "scale_score": self.scale_score,
-            "score_solver": self.score_solver,
             "pilot_perturbation_count": self.pilot_perturbation_count,
             "min_cells_per_perturbation": self.min_cells_per_perturbation,
             "random_seed": self.random_seed,
@@ -576,7 +574,6 @@ def _run_benchmark_core(
         score_lambda=config.score_lambda,
         scale_factor=config.scale_factor,
         scale_score=config.scale_score,
-        score_solver=config.score_solver,
         stage_observer=stage_observer,
     )
     exact_metadata = dict(result.attrs.get("ps_score_exact", {}))

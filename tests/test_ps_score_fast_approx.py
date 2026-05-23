@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pandas as pd
 from anndata import AnnData
 from scipy import sparse
 
@@ -257,7 +258,6 @@ def test_fast_approx_histclip_changes_signature_metadata_and_scores() -> None:
     assert clipped.metadata["clip_quantile"] == 0.5
     assert clipped.metadata["clip_bins"] == 16
     assert clipped.metadata["clip_method"] == "streaming_histogram"
-    assert clipped.metadata["clip_value_summary"]["count"] == clipped.metadata["union_target_gene_count"]
     assert clipped.metadata["signature_metadata"]["pertA"]["beta_norm"] < unclipped.metadata["signature_metadata"]["pertA"]["beta_norm"]
     assert not np.allclose(clipped.scores, unclipped.scores)
 
@@ -265,7 +265,7 @@ def test_fast_approx_histclip_changes_signature_metadata_and_scores() -> None:
 def test_fast_approx_main_writes_manifest_and_outputs(tmp_path) -> None:
     dataset_path = tmp_path / "toy.h5ad"
     output_dir = tmp_path / "fast-approx"
-    _make_clip_demo_adata().write_h5ad(dataset_path)
+    _make_fast_approx_adata().write_h5ad(dataset_path)
 
     report = main(
         [
@@ -277,6 +277,8 @@ def test_fast_approx_main_writes_manifest_and_outputs(tmp_path) -> None:
             "perturbation",
             "--ctrl-name",
             "control",
+            "--null-label",
+            "unassigned",
             "--top-n",
             "1",
             "--chunk-size",
@@ -291,19 +293,28 @@ def test_fast_approx_main_writes_manifest_and_outputs(tmp_path) -> None:
     )
 
     manifest_path = output_dir / "ps-score-fast-approx-manifest.json"
-    score_path = output_dir / "ps-score-fast-approx.npy"
-    valid_mask_path = output_dir / "ps-score-fast-approx-valid-mask.npy"
+    score_path = output_dir / "ps-score-fast-approx.csv"
 
     assert manifest_path.exists()
     assert score_path.exists()
-    assert valid_mask_path.exists()
     saved = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert saved["dataset_path"] == str(dataset_path)
-    assert tuple(saved["score_vector_shape"]) == (6, 1)
+    assert tuple(saved["score_vector_shape"]) == (8, 1)
+    assert saved["score_output_format"] == "csv_long"
+    assert saved["score_count"] == 8
     assert saved["target_basis"] == "union"
     assert saved["clip_quantile"] == 0.5
     assert saved["clip_bins"] == 16
     assert saved["clip_method"] == "streaming_histogram"
     assert saved["union_target_gene_count"] == 2
-    assert report["score_output_paths"]["normalized_scores"] == str(score_path)
-    assert np.load(score_path).shape == (6, 1)
+    assert report["score_output_paths"]["scores"] == str(score_path)
+    scores = pd.read_csv(score_path)
+    assert list(scores.columns) == ["obs_index", "ps_score", "perturbation"]
+    assert scores.shape == (8, 3)
+    by_obs = scores.set_index("obs_index")
+    assert by_obs.loc["ctrl-1", "ps_score"] == 0.0
+    assert by_obs.loc["ctrl-1", "perturbation"] == "control"
+    assert pd.isna(by_obs.loc["solo-1", "ps_score"])
+    assert pd.isna(by_obs.loc["solo-1", "perturbation"])
+    assert pd.isna(by_obs.loc["null-1", "ps_score"])
+    assert pd.isna(by_obs.loc["null-1", "perturbation"])

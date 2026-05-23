@@ -15,9 +15,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy import linalg, sparse
-from scipy.optimize import lsq_linear
 
-from .stats import extract_anndata_matrix, get_obs_column, resolve_perturbations, validate_layer
+from .stream import extract_anndata_matrix
+from .utils import resolve_perturbations
 
 
 RESULT_COLUMNS = [
@@ -34,7 +34,6 @@ RESULT_COLUMNS = [
 ]
 
 SUPPORTED_TARGET_GENE_SOURCES = ("provided", "scanpy_de", "hvg")
-SUPPORTED_SCORE_SOLVERS = ("closed_form", "lsq_linear")
 
 
 def run_ps_score_exact_anndata(
@@ -58,7 +57,6 @@ def run_ps_score_exact_anndata(
     score_lambda: float = 0.0,
     scale_factor: float = 3.0,
     scale_score: bool = True,
-    score_solver: str = "closed_form",
     return_wide: bool = False,
     stage_observer: Callable[[str, str, Mapping[str, Any]], None] | None = None,
 ) -> pd.DataFrame:
@@ -70,41 +68,17 @@ def run_ps_score_exact_anndata(
     target-selection parity.
     """
 
-    _validate_adata_like(adata)
     if not isinstance(perturb_column, str) or not perturb_column:
         raise ValueError("perturb_column must be a non-empty string")
     if not isinstance(ctrl_name, str) or not ctrl_name:
         raise ValueError("ctrl_name must be a non-empty string")
-    validate_layer(layer)
-    counts_layer = _validate_optional_layer_name(counts_layer, name="counts_layer")
     _validate_target_genes(target_genes)
-    target_gene_source = _validate_target_gene_source(target_gene_source)
+    if target_gene_source not in SUPPORTED_TARGET_GENE_SOURCES:
+        raise ValueError(f"Unsupported target_gene_source {target_gene_source!r}")
     if not isinstance(hvg_key, str) or not hvg_key:
         raise ValueError("hvg_key must be a non-empty string")
-    target_gene_min = _validate_positive_int("target_gene_min", target_gene_min)
-    target_gene_max = _validate_positive_int("target_gene_max", target_gene_max)
     if target_gene_max < target_gene_min:
         raise ValueError("target_gene_max must be greater than or equal to target_gene_min")
-    gene_filter_min_fraction = _validate_fraction(
-        "gene_filter_min_fraction",
-        gene_filter_min_fraction,
-        allow_zero=True,
-        allow_one=True,
-    )
-    clip_quantile = _validate_fraction(
-        "clip_quantile",
-        clip_quantile,
-        allow_zero=False,
-        allow_one=True,
-    )
-    lr_lambda = _validate_non_negative_float("lr_lambda", lr_lambda)
-    score_lambda = _validate_non_negative_float("score_lambda", score_lambda)
-    scale_factor = _validate_positive_float("scale_factor", scale_factor)
-    score_solver = _validate_score_solver(score_solver)
-    _validate_bool("apply_gene_filter", apply_gene_filter)
-    _validate_bool("apply_quantile_clip", apply_quantile_clip)
-    _validate_bool("scale_score", scale_score)
-    _validate_bool("return_wide", return_wide)
 
     if target_gene_source == "provided" and target_genes is None:
         raise ValueError("target_genes must be provided when target_gene_source='provided'")
@@ -113,7 +87,7 @@ def run_ps_score_exact_anndata(
             "target_genes must be None unless target_gene_source='provided'"
         )
 
-    labels_all = np.asarray(get_obs_column(adata.obs, perturb_column), dtype=object)
+    labels_all = np.asarray(adata.obs[perturb_column], dtype=object)
     row_ids_all = np.asarray(adata.obs_names, dtype=object)
     if labels_all.ndim != 1 or labels_all.size == 0:
         raise ValueError("adata must contain at least one observation")
@@ -156,7 +130,6 @@ def run_ps_score_exact_anndata(
 
     use_sparse_closed_form, sparse_fallback_reason = _resolve_sparse_computation_mode(
         expression_matrix=expression_matrix,
-        score_solver=score_solver,
         apply_quantile_clip=apply_quantile_clip,
     )
 
@@ -295,7 +268,6 @@ def run_ps_score_exact_anndata(
                 score_lambda=score_lambda,
                 scale_factor=scale_factor,
                 scale_score=scale_score,
-                score_solver=score_solver,
             )
 
             if return_wide:
@@ -359,7 +331,6 @@ def run_ps_score_exact_anndata(
         "score_lambda": float(score_lambda),
         "scale_factor": float(scale_factor),
         "scale_score": bool(scale_score),
-        "score_solver": score_solver,
         "x_shape": x_shape,
         "y_shape": tuple(int(value) for value in y_matrix.shape),
         "beta_shape": tuple(int(value) for value in beta.shape),
@@ -381,20 +352,6 @@ def _notify_stage_observer(
     observer(stage_name, event, details)
 
 
-def _validate_adata_like(adata: Any) -> None:
-    if adata is None:
-        raise ValueError("adata must not be None")
-    for attribute in ("X", "layers", "obs", "obs_names", "var", "var_names"):
-        if not hasattr(adata, attribute):
-            raise TypeError(f"adata must provide {attribute}")
-
-
-def _validate_optional_layer_name(value: str | None, *, name: str) -> str | None:
-    if value is not None and not isinstance(value, str):
-        raise TypeError(f"{name} must be a string or None")
-    return value
-
-
 def _validate_target_genes(
     target_genes: Mapping[str, Sequence[str]] | Sequence[str] | None,
 ) -> None:
@@ -409,65 +366,6 @@ def _validate_target_genes(
             _normalize_gene_names(genes)
         return
     _normalize_gene_names(target_genes)
-
-
-def _validate_target_gene_source(value: str) -> str:
-    if value not in SUPPORTED_TARGET_GENE_SOURCES:
-        allowed = ", ".join(SUPPORTED_TARGET_GENE_SOURCES)
-        raise ValueError(f"Unsupported target_gene_source {value!r}; expected one of: {allowed}")
-    return value
-
-
-def _validate_score_solver(value: str) -> str:
-    if value not in SUPPORTED_SCORE_SOLVERS:
-        allowed = ", ".join(SUPPORTED_SCORE_SOLVERS)
-        raise ValueError(f"Unsupported score_solver {value!r}; expected one of: {allowed}")
-    return value
-
-
-def _validate_positive_int(name: str, value: int) -> int:
-    if not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-def _validate_positive_float(name: str, value: float) -> float:
-    if not isinstance(value, (int, float)) or value <= 0:
-        raise ValueError(f"{name} must be a positive number")
-    return float(value)
-
-
-def _validate_non_negative_float(name: str, value: float) -> float:
-    if not isinstance(value, (int, float)) or value < 0:
-        raise ValueError(f"{name} must be a non-negative number")
-    return float(value)
-
-
-def _validate_fraction(
-    name: str,
-    value: float,
-    *,
-    allow_zero: bool,
-    allow_one: bool,
-) -> float:
-    if not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be a numeric value")
-    lower_ok = value >= 0 if allow_zero else value > 0
-    upper_ok = value <= 1 if allow_one else value < 1
-    if not lower_ok or not upper_ok:
-        if allow_zero and allow_one:
-            raise ValueError(f"{name} must be between 0 and 1 inclusive")
-        if allow_zero:
-            raise ValueError(f"{name} must be in [0, 1)")
-        if allow_one:
-            raise ValueError(f"{name} must be in (0, 1]")
-        raise ValueError(f"{name} must be between 0 and 1")
-    return float(value)
-
-
-def _validate_bool(name: str, value: bool) -> None:
-    if not isinstance(value, bool):
-        raise TypeError(f"{name} must be a boolean")
 
 
 def _normalize_gene_names(genes: Sequence[str]) -> list[str]:
@@ -764,13 +662,10 @@ def _ordered_union(groups: Any) -> list[str]:
 def _resolve_sparse_computation_mode(
     *,
     expression_matrix: Any,
-    score_solver: str,
     apply_quantile_clip: bool,
 ) -> tuple[bool, str | None]:
     if not sparse.issparse(expression_matrix):
         return False, None
-    if score_solver != "closed_form":
-        return False, f"score_solver={score_solver}"
     if apply_quantile_clip:
         return False, "apply_quantile_clip=True"
     return True, None
@@ -947,7 +842,6 @@ def _build_sparse_result(
             "target_count": int(target_rows.size),
             "max_score_before_column_scale": max_before_scaling,
             "column_scaled": bool(scale_score and max_before_scaling > 0),
-            "score_solver": "closed_form",
         }
 
     if return_wide:
@@ -976,7 +870,6 @@ def _compute_scores(
     score_lambda: float,
     scale_factor: float,
     scale_score: bool,
-    score_solver: str,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     score_matrix = np.zeros((labels.shape[0], len(selected_perturbations)), dtype=float)
     baseline = beta[0]
@@ -990,21 +883,8 @@ def _compute_scores(
             raise ValueError(f"Perturbation {perturbation!r} produced a zero beta vector")
         if target_mask.any():
             centered = y_matrix[target_mask] - baseline
-            if score_solver == "closed_form":
-                raw = (centered @ perturbation_beta - score_lambda) / beta_norm_sq
-                bounded = np.clip(raw, 0.0, scale_factor)
-            elif score_solver == "lsq_linear":
-                bounded = _solve_bounded_scores_lsq_linear(
-                    centered=centered,
-                    perturbation_beta=perturbation_beta,
-                    beta_norm_sq=beta_norm_sq,
-                    score_lambda=score_lambda,
-                    scale_factor=scale_factor,
-                )
-            else:
-                raise NotImplementedError(
-                "ps score solver not supported: use closed_form or lsq_linear"
-            )
+            raw = (centered @ perturbation_beta - score_lambda) / beta_norm_sq
+            bounded = np.clip(raw, 0.0, scale_factor)
             score_matrix[target_mask, column_index] = bounded / scale_factor
         max_before_scaling = float(score_matrix[:, column_index].max(initial=0.0))
         if scale_score and max_before_scaling > 0:
@@ -1015,35 +895,9 @@ def _compute_scores(
             "target_count": int(np.sum(target_mask)),
             "max_score_before_column_scale": max_before_scaling,
             "column_scaled": bool(scale_score and max_before_scaling > 0),
-            "score_solver": score_solver,
         }
 
     return score_matrix, metadata
-
-
-def _solve_bounded_scores_lsq_linear(
-    *,
-    centered: np.ndarray,
-    perturbation_beta: np.ndarray,
-    beta_norm_sq: float,
-    score_lambda: float,
-    scale_factor: float,
-) -> np.ndarray:
-    design = perturbation_beta[:, None]
-    adjusted_targets = centered - (score_lambda / beta_norm_sq) * perturbation_beta
-    scores = np.zeros(centered.shape[0], dtype=float)
-
-    for row_index, target in enumerate(adjusted_targets):
-        result = lsq_linear(
-            design,
-            target,
-            bounds=(0.0, scale_factor),
-            lsq_solver="exact",
-        )
-        if not result.success:
-            raise ValueError("Bounded lsq_linear PS-score solve failed")
-        scores[row_index] = float(result.x[0])
-    return scores
 
 
 def _build_long_result(

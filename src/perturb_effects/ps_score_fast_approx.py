@@ -4,19 +4,26 @@ from __future__ import annotations
 
 import argparse
 import json
-import resource
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 from scipy import sparse
 
-from .stats import extract_anndata_matrix, get_obs_column, top_k_indices, validate_layer, welch_t_scores_from_stats
-from .types import StreamFeatureStats
+from .stats import FeatureMoments, top_k_indices, welch_t_scores_from_stats
+from .stream import (
+    accumulate_nonzero_histogram,
+    clip_matrix_columns,
+    clip_values_from_histogram,
+    extract_anndata_matrix,
+    log_normalize_chunk,
+)
+from .utils import is_missing_label, max_rss_kb, ordered_union_indices, to_jsonable
 
 
 DEFAULT_TARGET_SUM = 1e4
@@ -27,44 +34,10 @@ DEFAULT_CLIP_BINS = 2048
 class FastApproxPsResult:
     scores: np.ndarray
     valid_mask: np.ndarray
+    obs_index: np.ndarray
+    labels: np.ndarray
+    control_mask: np.ndarray
     metadata: dict[str, Any]
-
-
-@dataclass
-class _MutableFeatureStats:
-    count: int
-    sums: np.ndarray
-    squared_sums: np.ndarray
-
-    @classmethod
-    def zeros(cls, n_features: int) -> _MutableFeatureStats:
-        return cls(
-            count=0,
-            sums=np.zeros(n_features, dtype=np.float64),
-            squared_sums=np.zeros(n_features, dtype=np.float64),
-        )
-
-    def add_matrix(self, matrix: Any) -> None:
-        if sparse.issparse(matrix):
-            self.count += int(matrix.shape[0])
-            self.sums += np.asarray(matrix.sum(axis=0)).ravel().astype(np.float64, copy=False)
-            self.squared_sums += np.asarray(matrix.power(2).sum(axis=0)).ravel().astype(
-                np.float64,
-                copy=False,
-            )
-            return
-
-        dense = np.asarray(matrix, dtype=np.float64)
-        self.count += int(dense.shape[0])
-        self.sums += dense.sum(axis=0)
-        self.squared_sums += np.square(dense).sum(axis=0)
-
-    def freeze(self) -> StreamFeatureStats:
-        return StreamFeatureStats(
-            count=self.count,
-            sums=self.sums.copy(),
-            squared_sums=self.squared_sums.copy(),
-        )
 
 
 @dataclass(frozen=True)
@@ -96,26 +69,15 @@ def run_ps_score_fast_approx_anndata(
 ) -> FastApproxPsResult:
     """Score each cell only against its observed perturbation label."""
 
-    if adata is None:
-        raise ValueError("adata must not be None")
-    if not isinstance(perturb_column, str) or not perturb_column:
-        raise ValueError("perturb_column must be a non-empty string")
-    if not isinstance(ctrl_name, str) or not ctrl_name:
-        raise ValueError("ctrl_name must be a non-empty string")
-    validate_layer(layer)
-    top_n = _validate_positive_int("top_n", top_n)
-    chunk_size = _validate_positive_int("chunk_size", chunk_size)
-    min_cells_per_perturbation = _validate_positive_int(
-        "min_cells_per_perturbation",
-        min_cells_per_perturbation,
-    )
-    scale_factor = _validate_positive_float("scale_factor", scale_factor)
-    target_sum = _validate_positive_float("target_sum", target_sum)
-    clip_quantile = _validate_clip_quantile(clip_quantile)
-    clip_bins = _validate_clip_bins(clip_bins)
-    target_basis = _validate_target_basis(target_basis)
+    if target_basis not in {"per_perturbation", "union"}:
+        raise ValueError("target_basis must be 'per_perturbation' or 'union'")
+    if clip_quantile is not None and not (0.0 < clip_quantile <= 1.0):
+        raise ValueError("clip_quantile must be in (0, 1]")
+    if clip_bins < 2:
+        raise ValueError("clip_bins must be >= 2")
 
-    labels = np.asarray(get_obs_column(adata.obs, perturb_column), dtype=object)
+    labels = np.asarray(adata.obs[perturb_column], dtype=object)
+    obs_index = np.asarray(adata.obs_names, dtype=object)
     if labels.ndim != 1 or labels.size == 0:
         raise ValueError("adata must contain at least one observation")
     if not np.any(labels == ctrl_name):
@@ -136,11 +98,11 @@ def run_ps_score_fast_approx_anndata(
     selected_set = set(selected)
 
     stage_start = time.perf_counter()
-    stats_by_label: dict[str, _MutableFeatureStats] = {
-        ctrl_name: _MutableFeatureStats.zeros(var_names.shape[0])
+    stats_by_label: dict[str, FeatureMoments] = {
+        ctrl_name: FeatureMoments.zeros(var_names.shape[0])
     }
     for perturbation in selected:
-        stats_by_label[perturbation] = _MutableFeatureStats.zeros(var_names.shape[0])
+        stats_by_label[perturbation] = FeatureMoments.zeros(var_names.shape[0])
 
     max_value = float(np.log1p(target_sum))
     all_gene_hist: np.ndarray | None = None
@@ -152,12 +114,12 @@ def run_ps_score_fast_approx_anndata(
     pass1_start = time.perf_counter()
     for start in range(0, labels.shape[0], chunk_size):
         stop = min(start + chunk_size, labels.shape[0])
-        chunk = _log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
+        chunk = log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
         chunk_labels = labels[start:stop]
         if all_gene_hist is not None and all_gene_nonzero_counts is not None:
             model_mask = _model_label_mask(chunk_labels, ctrl_name=ctrl_name, selected_set=selected_set)
             if np.any(model_mask):
-                _accumulate_nonzero_histogram(
+                accumulate_nonzero_histogram(
                     chunk[model_mask],
                     hist=all_gene_hist,
                     nonzero_counts=all_gene_nonzero_counts,
@@ -197,7 +159,7 @@ def run_ps_score_fast_approx_anndata(
         gene_indices = top_k_indices(t_scores, min(top_n, t_scores.shape[0]), absolute=True)
         target_gene_indices_by_perturbation[perturbation] = gene_indices.astype(np.int64, copy=False)
 
-    union_target_gene_indices = _ordered_union_indices(target_gene_indices_by_perturbation.values())
+    union_target_gene_indices = ordered_union_indices(target_gene_indices_by_perturbation.values())
     union_target_genes = [str(var_names[index]) for index in union_target_gene_indices]
     clip_values: np.ndarray | None = None
     clip_threshold_seconds = 0.0
@@ -231,11 +193,11 @@ def run_ps_score_fast_approx_anndata(
             signature_metadata[perturbation] = signature_record
     else:
         union_index_lookup = {int(index): position for position, index in enumerate(union_target_gene_indices)}
-        clipped_union_stats: dict[str, _MutableFeatureStats] | None = None
+        clipped_union_stats: dict[str, FeatureMoments] | None = None
         clipped_control_mean = None
         if clip_quantile is not None and union_target_gene_indices.size:
             clip_start = time.perf_counter()
-            clip_values = _extract_clip_values_for_gene_indices(
+            clip_values = clip_values_from_histogram(
                 hist=all_gene_hist,
                 nonzero_counts=all_gene_nonzero_counts,
                 gene_indices=union_target_gene_indices,
@@ -246,14 +208,14 @@ def run_ps_score_fast_approx_anndata(
             clip_threshold_seconds = time.perf_counter() - clip_start
 
             clipped_stats_start = time.perf_counter()
-            clipped_union_stats = {ctrl_name: _MutableFeatureStats.zeros(union_target_gene_indices.shape[0])}
+            clipped_union_stats = {ctrl_name: FeatureMoments.zeros(union_target_gene_indices.shape[0])}
             for perturbation in target_gene_indices_by_perturbation:
-                clipped_union_stats[perturbation] = _MutableFeatureStats.zeros(union_target_gene_indices.shape[0])
+                clipped_union_stats[perturbation] = FeatureMoments.zeros(union_target_gene_indices.shape[0])
             for start in range(0, labels.shape[0], chunk_size):
                 stop = min(start + chunk_size, labels.shape[0])
-                chunk = _log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
+                chunk = log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
                 chunk = chunk[:, union_target_gene_indices]
-                chunk = _clip_matrix_columns(chunk, clip_values)
+                chunk = clip_matrix_columns(chunk, clip_values)
                 chunk_labels = labels[start:stop]
                 for label_key in _iter_unique_label_keys(chunk_labels):
                     if label_key not in clipped_union_stats:
@@ -319,11 +281,11 @@ def run_ps_score_fast_approx_anndata(
     pass2_start = time.perf_counter()
     for start in range(0, labels.shape[0], chunk_size):
         stop = min(start + chunk_size, labels.shape[0])
-        chunk = _log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
+        chunk = log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
         if clip_quantile is not None or target_basis == "union":
             chunk = chunk[:, union_target_gene_indices]
             if clip_values is not None:
-                chunk = _clip_matrix_columns(chunk, clip_values)
+                chunk = clip_matrix_columns(chunk, clip_values)
         chunk_labels = labels[start:stop]
         row_indices = np.arange(start, stop, dtype=np.int64)
         for perturbation in _iter_unique_label_keys(chunk_labels):
@@ -360,13 +322,13 @@ def run_ps_score_fast_approx_anndata(
         sum(
             1
             for label in labels
-            if not _is_missing_label(label)
+            if not is_missing_label(label)
             and label != ctrl_name
             and label not in null_label_set
             and label not in selected_set
         )
     )
-    invalid_count = int(sum(1 for label in labels if _is_missing_label(label) or label in null_label_set))
+    invalid_count = int(sum(1 for label in labels if is_missing_label(label) or label in null_label_set))
     skipped_cell_count = int(sum(signature_data["cell_count"] for signature_data in skipped.values()))
     metadata = {
         "algorithm": "ps_score_fast_approx",
@@ -379,7 +341,6 @@ def run_ps_score_fast_approx_anndata(
         "clip_quantile": None if clip_quantile is None else float(clip_quantile),
         "clip_method": None if clip_quantile is None else "streaming_histogram",
         "clip_bins": None if clip_quantile is None else int(clip_bins),
-        "clip_value_summary": _summarize_clip_values(clip_values),
         "chunk_size": int(chunk_size),
         "target_sum": float(target_sum),
         "scale_factor": float(scale_factor),
@@ -404,9 +365,16 @@ def run_ps_score_fast_approx_anndata(
             "pass2_seconds": float(pass2_seconds),
             "total_seconds": float(time.perf_counter() - stage_start),
         },
-        "max_rss_kb": _max_rss_kb(),
+        "max_rss_kb": max_rss_kb(),
     }
-    return FastApproxPsResult(scores=scores.reshape(-1, 1), valid_mask=valid_mask, metadata=metadata)
+    return FastApproxPsResult(
+        scores=scores.reshape(-1, 1),
+        valid_mask=valid_mask,
+        obs_index=obs_index,
+        labels=labels,
+        control_mask=labels == ctrl_name,
+        metadata=metadata,
+    )
 
 
 def run_ps_score_fast_approx_dataset(
@@ -428,25 +396,22 @@ def run_ps_score_fast_approx_dataset(
     target_basis: str = "per_perturbation",
 ) -> dict[str, Any]:
     adata = ad.read_h5ad(Path(dataset_path), backed="r")
-    try:
-        result = run_ps_score_fast_approx_anndata(
-            adata,
-            perturb_column=perturb_column,
-            ctrl_name=ctrl_name,
-            layer=layer,
-            perturbations=perturbations,
-            null_labels=null_labels,
-            top_n=top_n,
-            chunk_size=chunk_size,
-            scale_factor=scale_factor,
-            target_sum=target_sum,
-            min_cells_per_perturbation=min_cells_per_perturbation,
-            clip_quantile=clip_quantile,
-            clip_bins=clip_bins,
-            target_basis=target_basis,
-        )
-    finally:
-        _close_adata(adata)
+    result = run_ps_score_fast_approx_anndata(
+        adata,
+        perturb_column=perturb_column,
+        ctrl_name=ctrl_name,
+        layer=layer,
+        perturbations=perturbations,
+        null_labels=null_labels,
+        top_n=top_n,
+        chunk_size=chunk_size,
+        scale_factor=scale_factor,
+        target_sum=target_sum,
+        min_cells_per_perturbation=min_cells_per_perturbation,
+        clip_quantile=clip_quantile,
+        clip_bins=clip_bins,
+        target_basis=target_basis,
+    )
     return write_ps_score_fast_approx_output(
         result,
         output_dir=output_dir,
@@ -463,57 +428,35 @@ def write_ps_score_fast_approx_output(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    score_path = output_path / "ps-score-fast-approx.npy"
-    valid_mask_path = output_path / "ps-score-fast-approx-valid-mask.npy"
-    signature_path = output_path / "ps-score-fast-approx-signatures.json"
+    score_path = output_path / "ps-score-fast-approx.csv"
     manifest_path = output_path / "ps-score-fast-approx-manifest.json"
 
-    np.save(score_path, result.scores)
-    np.save(valid_mask_path, result.valid_mask)
-    with signature_path.open("w", encoding="utf-8") as handle:
-        json.dump(
-            _to_jsonable(
-                {
-                    "signature_metadata": result.metadata["signature_metadata"],
-                    "skipped_perturbations": result.metadata["skipped_perturbations"],
-                }
-            ),
-            handle,
-            indent=2,
-            sort_keys=True,
-        )
-        handle.write("\n")
+    table = _score_result_dataframe(result)
+    table.to_csv(score_path, index=False)
 
-    manifest = {
-        "algorithm": result.metadata["algorithm"],
-        "dataset_path": None if dataset_path is None else str(dataset_path),
-        "perturbation_column": result.metadata["perturb_column"],
-        "control_label": result.metadata["control_label"],
-        "top_gene_count": result.metadata["top_gene_count"],
-        "target_basis": result.metadata["target_basis"],
-        "quantile_clip": result.metadata["quantile_clip"],
-        "clip_quantile": result.metadata["clip_quantile"],
-        "clip_method": result.metadata["clip_method"],
-        "clip_bins": result.metadata["clip_bins"],
-        "clip_value_summary": result.metadata["clip_value_summary"],
-        "chunk_size": result.metadata["chunk_size"],
-        "target_sum": result.metadata["target_sum"],
-        "union_target_gene_count": result.metadata["union_target_gene_count"],
-        "valid_perturbation_count": result.metadata["valid_perturbation_count"],
-        "skipped_perturbation_count": result.metadata["skipped_perturbation_count"],
-        "score_vector_shape": result.metadata["score_vector_shape"],
-        "score_output_paths": {
-            "normalized_scores": str(score_path),
-            "valid_mask": str(valid_mask_path),
-            "signature_metadata": str(signature_path),
-        },
-        "timings": result.metadata["timings"],
-        "max_rss_kb": result.metadata["max_rss_kb"],
-    }
+    manifest = dict(result.metadata)
+    manifest.update(
+        {
+            "dataset_path": None if dataset_path is None else str(dataset_path),
+            "score_output_format": "csv_long",
+            "score_count": int(table.shape[0]),
+            "score_output_paths": {"scores": str(score_path)},
+        }
+    )
     with manifest_path.open("w", encoding="utf-8") as handle:
-        json.dump(_to_jsonable(manifest), handle, indent=2, sort_keys=True)
+        json.dump(to_jsonable(manifest), handle, indent=2, sort_keys=True)
         handle.write("\n")
     return manifest
+
+
+def _score_result_dataframe(result: FastApproxPsResult) -> pd.DataFrame:
+    scores = np.full(result.obs_index.shape[0], np.nan, dtype=np.float64)
+    perturbations = np.full(result.obs_index.shape[0], None, dtype=object)
+    scores[result.control_mask] = 0.0
+    perturbations[result.control_mask] = result.metadata["control_label"]
+    scores[result.valid_mask] = result.scores[result.valid_mask, 0].astype(np.float64, copy=False)
+    perturbations[result.valid_mask] = result.labels[result.valid_mask]
+    return pd.DataFrame({"obs_index": result.obs_index, "ps_score": scores, "perturbation": perturbations})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -567,7 +510,7 @@ def _resolve_selected_perturbations(
     available: list[str] = []
     available_set: set[str] = set()
     for label in labels:
-        if _is_missing_label(label) or label == control_label or label in null_labels:
+        if is_missing_label(label) or label == control_label or label in null_labels:
             continue
         key = str(label)
         if key in available_set:
@@ -595,27 +538,6 @@ def _resolve_selected_perturbations(
     if missing:
         raise ValueError("Unknown perturbation labels requested: " + ", ".join(sorted(missing)))
     return selected
-
-
-def _log_normalize_chunk(matrix: Any, *, target_sum: float) -> Any:
-    if sparse.issparse(matrix):
-        work = matrix.tocsr(copy=True).astype(np.float64)
-        totals = np.asarray(work.sum(axis=1)).ravel()
-        scales = np.zeros(work.shape[0], dtype=np.float64)
-        nonzero = totals > 0
-        scales[nonzero] = target_sum / totals[nonzero]
-        work = work.multiply(scales[:, None]).tocsr()
-        work.data = np.log1p(work.data)
-        return work
-
-    dense = np.asarray(matrix, dtype=np.float64).copy()
-    if dense.ndim != 2:
-        raise ValueError("matrix chunks must be two-dimensional")
-    totals = dense.sum(axis=1, keepdims=True)
-    nonzero = totals[:, 0] > 0
-    dense[nonzero] *= target_sum / totals[nonzero]
-    dense[~nonzero] = 0.0
-    return np.log1p(dense)
 
 
 def _project_signature(matrix: Any, signature: _Signature) -> np.ndarray:
@@ -684,7 +606,7 @@ def _iter_unique_label_keys(labels: Sequence[Any]) -> list[str]:
     seen: set[str] = set()
     unique: list[str] = []
     for label in labels:
-        if _is_missing_label(label):
+        if is_missing_label(label):
             continue
         key = str(label)
         if key in seen:
@@ -694,34 +616,6 @@ def _iter_unique_label_keys(labels: Sequence[Any]) -> list[str]:
     return unique
 
 
-def _is_missing_label(label: Any) -> bool:
-    if label is None:
-        return True
-    if isinstance(label, (float, np.floating)):
-        return bool(np.isnan(label))
-    return False
-
-
-def _validate_clip_quantile(value: float | None) -> float | None:
-    if value is None:
-        return None
-    if not isinstance(value, (int, float, np.integer, np.floating)) or float(value) <= 0.0 or float(value) > 1.0:
-        raise ValueError("clip_quantile must be in (0, 1]")
-    return float(value)
-
-
-def _validate_clip_bins(value: int) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 2:
-        raise ValueError("clip_bins must be an integer >= 2")
-    return int(value)
-
-
-def _validate_target_basis(value: str) -> str:
-    if value not in {"per_perturbation", "union"}:
-        raise ValueError("target_basis must be 'per_perturbation' or 'union'")
-    return value
-
-
 def _model_label_mask(
     labels: Sequence[Any],
     *,
@@ -729,184 +623,9 @@ def _model_label_mask(
     selected_set: set[str],
 ) -> np.ndarray:
     return np.asarray(
-        [False if _is_missing_label(label) else (str(label) == ctrl_name or str(label) in selected_set) for label in labels],
+        [False if is_missing_label(label) else (str(label) == ctrl_name or str(label) in selected_set) for label in labels],
         dtype=bool,
     )
-
-
-def _accumulate_nonzero_histogram(
-    matrix: Any,
-    *,
-    hist: np.ndarray,
-    nonzero_counts: np.ndarray,
-    max_value: float,
-) -> None:
-    if sparse.issparse(matrix):
-        coo = matrix.tocoo()
-        positive = coo.data > 0.0
-        if not np.any(positive):
-            return
-        columns = coo.col[positive]
-        nonzero_counts += np.bincount(columns, minlength=hist.shape[0]).astype(np.int64, copy=False)
-        bin_indices = _histogram_bin_indices(coo.data[positive], bins=hist.shape[1], max_value=max_value)
-        np.add.at(hist, (columns, bin_indices), 1)
-        return
-
-    dense = np.asarray(matrix, dtype=np.float64)
-    nonzero_rows, nonzero_cols = np.nonzero(dense > 0.0)
-    if nonzero_cols.size == 0:
-        return
-    nonzero_counts += np.bincount(nonzero_cols, minlength=hist.shape[0]).astype(np.int64, copy=False)
-    bin_indices = _histogram_bin_indices(dense[nonzero_rows, nonzero_cols], bins=hist.shape[1], max_value=max_value)
-    np.add.at(hist, (nonzero_cols, bin_indices), 1)
-
-
-def _extract_clip_values_for_gene_indices(
-    *,
-    hist: np.ndarray | None,
-    nonzero_counts: np.ndarray | None,
-    gene_indices: np.ndarray,
-    model_cell_count: int,
-    quantile: float,
-    max_value: float,
-) -> np.ndarray:
-    if hist is None or nonzero_counts is None:
-        raise ValueError("clip histograms were not collected")
-    if model_cell_count <= 0:
-        raise ValueError("Cannot estimate clip values without model cells")
-    if gene_indices.size == 0:
-        return np.zeros(0, dtype=np.float64)
-    zero_counts = np.full(gene_indices.shape[0], model_cell_count, dtype=np.int64) - nonzero_counts[gene_indices]
-    return _histogram_quantiles(
-        hist[gene_indices],
-        zero_counts=zero_counts,
-        total_count=model_cell_count,
-        quantile=quantile,
-        max_value=max_value,
-    )
-
-
-def _histogram_bin_indices(values: np.ndarray, *, bins: int, max_value: float) -> np.ndarray:
-    scaled = np.asarray(values, dtype=np.float64) / max_value
-    indices = np.floor(scaled * bins).astype(np.int64, copy=False)
-    return np.clip(indices, 0, bins - 1)
-
-
-def _histogram_quantiles(
-    hist: np.ndarray,
-    *,
-    zero_counts: np.ndarray,
-    total_count: int,
-    quantile: float,
-    max_value: float,
-) -> np.ndarray:
-    edges = (np.arange(1, hist.shape[1] + 1, dtype=np.float64) * max_value) / float(hist.shape[1])
-    position = float(total_count - 1) * quantile
-    lower_rank = int(np.floor(position))
-    upper_rank = int(np.ceil(position))
-    fraction = position - float(lower_rank)
-
-    clip_values = np.zeros(hist.shape[0], dtype=np.float64)
-    for gene_index in range(hist.shape[0]):
-        lower = _histogram_value_at_rank(
-            hist[gene_index],
-            zero_count=int(zero_counts[gene_index]),
-            rank=lower_rank,
-            edges=edges,
-        )
-        upper = _histogram_value_at_rank(
-            hist[gene_index],
-            zero_count=int(zero_counts[gene_index]),
-            rank=upper_rank,
-            edges=edges,
-        )
-        clip_values[gene_index] = lower + fraction * (upper - lower)
-    return clip_values
-
-
-def _histogram_value_at_rank(hist_row: np.ndarray, *, zero_count: int, rank: int, edges: np.ndarray) -> float:
-    if rank < zero_count:
-        return 0.0
-    nonzero_rank = rank - zero_count
-    cumulative = np.cumsum(hist_row, dtype=np.int64)
-    if cumulative.size == 0 or cumulative[-1] == 0:
-        return 0.0
-    bin_index = int(np.searchsorted(cumulative, nonzero_rank + 1, side="left"))
-    if bin_index >= edges.shape[0]:
-        bin_index = edges.shape[0] - 1
-    return float(edges[bin_index])
-
-
-def _clip_matrix_columns(matrix: Any, clip_values: np.ndarray) -> Any:
-    if sparse.issparse(matrix):
-        work = matrix.tocsr(copy=True).astype(np.float64)
-        if work.data.size:
-            work.data = np.minimum(work.data, clip_values[work.indices])
-            work.eliminate_zeros()
-        return work
-
-    dense = np.asarray(matrix, dtype=np.float64).copy()
-    return np.minimum(dense, clip_values[None, :])
-
-
-def _summarize_clip_values(clip_values: np.ndarray | None) -> dict[str, Any] | None:
-    if clip_values is None:
-        return None
-    return {
-        "count": int(clip_values.shape[0]),
-        "min": float(np.min(clip_values)) if clip_values.size else 0.0,
-        "max": float(np.max(clip_values)) if clip_values.size else 0.0,
-        "mean": float(np.mean(clip_values)) if clip_values.size else 0.0,
-        "zero_count": int(np.count_nonzero(clip_values == 0.0)),
-    }
-
-
-def _ordered_union_indices(groups: Any) -> np.ndarray:
-    union: list[int] = []
-    seen: set[int] = set()
-    for group in groups:
-        for index in group:
-            key = int(index)
-            if key in seen:
-                continue
-            union.append(key)
-            seen.add(key)
-    return np.asarray(union, dtype=np.int64)
-
-
-def _validate_positive_int(name: str, value: Any) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return int(value)
-
-
-def _validate_positive_float(name: str, value: Any) -> float:
-    if not isinstance(value, (int, float, np.integer, np.floating)) or float(value) <= 0:
-        raise ValueError(f"{name} must be a positive number")
-    return float(value)
-
-
-def _max_rss_kb() -> int:
-    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-
-
-def _close_adata(adata: Any) -> None:
-    if hasattr(adata, "file") and hasattr(adata.file, "close"):
-        adata.file.close()
-
-
-def _to_jsonable(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_jsonable(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (np.integer, np.floating)):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    return value
 
 
 __all__ = [

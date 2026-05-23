@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import resource
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -26,8 +25,16 @@ from scipy import sparse
 from scipy.optimize import minimize
 from scipy.sparse.linalg import spsolve
 
-from .stats import extract_anndata_matrix, get_obs_column, top_k_indices, validate_layer, welch_t_scores_from_stats
+from .stats import column_sums, log2_fold_change, top_k_indices, welch_t_scores_from_stats
+from .stream import (
+    accumulate_nonzero_histogram,
+    apply_log1p_chunk,
+    extract_anndata_matrix,
+    histogram_quantiles,
+    iter_matrix_chunks,
+)
 from .types import StreamFeatureStats
+from .utils import max_rss_kb, ordered_unique, ordered_union_indices, to_jsonable
 
 
 DEFAULT_TARGET_SUM = 1e4
@@ -101,7 +108,6 @@ def run_ps_score_exact_fast(
 ) -> ExactFastPsResult | ExactFastMultiLabelPsResult | dict[str, Any]:
     """Run exact-fast PS scoring from an AnnData object or backed h5ad path."""
 
-    validate_layer(layer)
     assert clip_quantile is None or 0.0 < clip_quantile <= 1.0
     assert clip_bins >= 2 and type(clip_bins) == int
     if logfc_threshold is not None and logfc_threshold < 0.0:
@@ -164,7 +170,7 @@ def run_ps_score_exact_fast(
         linear_sums=linear_sums,
         logfc_threshold=logfc_threshold,
     )
-    union_gene_indices = _ordered_union_indices(targets.values())
+    union_gene_indices = ordered_union_indices(targets.values())
     background_enabled = background_cluster_codes is not None
 
     clip_values = None if all_gene_clip_values is None else all_gene_clip_values[union_gene_indices]
@@ -348,7 +354,7 @@ def run_ps_score_exact_fast(
             "scoring_seconds": float(scoring_seconds),
             "total_seconds": float(time.perf_counter() - stage_start),
         },
-        "max_rss_kb": _max_rss_kb(),
+        "max_rss_kb": max_rss_kb(),
     }
     if background_enabled and background_control_counts is not None:
         metadata["background_cluster_count"] = int(len(background_cluster_names))
@@ -518,7 +524,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
 
 
 def _clean_obs_labels(adata: Any, perturb_column: str) -> np.ndarray:
-    raw = np.asarray(get_obs_column(adata.obs, perturb_column), dtype=object)
+    raw = np.asarray(adata.obs[perturb_column], dtype=object)
     labels: list[str] = []
     for row_index, value in enumerate(raw):
         if pd.isna(value):
@@ -533,7 +539,7 @@ def _clean_obs_labels(adata: Any, perturb_column: str) -> np.ndarray:
 def _background_cluster_codes(adata: Any, cluster_column: str | None) -> tuple[np.ndarray | None, list[str]]:
     if cluster_column is None:
         return None, []
-    raw = np.asarray(get_obs_column(adata.obs, cluster_column), dtype=object)
+    raw = np.asarray(adata.obs[cluster_column], dtype=object)
     labels: list[str] = []
     for row_index, value in enumerate(raw):
         if pd.isna(value):
@@ -542,7 +548,7 @@ def _background_cluster_codes(adata: Any, cluster_column: str | None) -> tuple[n
         if not label:
             raise ValueError(f"Empty background cluster label at obs row {row_index}")
         labels.append(label)
-    cluster_names = _ordered_unique(labels)
+    cluster_names = ordered_unique(labels)
     lookup = {cluster: index for index, cluster in enumerate(cluster_names)}
     return np.asarray([lookup[label] for label in labels], dtype=np.int32), cluster_names
 
@@ -567,7 +573,7 @@ def _parse_perturbations(
             raise ValueError(f"Malformed perturbation value at obs row {row_index}: {label!r}")
         if ctrl_name in tokens:
             raise ValueError(f"Control label cannot appear inside a perturbation combination at obs row {row_index}")
-        active = _ordered_unique(tokens)
+        active = ordered_unique(tokens)
         tokenized.append(active)
         for token in active:
             if token not in known_set:
@@ -607,18 +613,6 @@ def _select_perturbations(known: Sequence[str], perturbations: Sequence[str] | N
     if missing:
         raise ValueError("Requested perturbations are not present in the perturbation column: " + ", ".join(missing))
     return selected
-
-
-def _ordered_unique(values: Any) -> list[str]:
-    unique: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        key = str(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(key)
-    return unique
 
 
 def _select_target_genes(
@@ -666,7 +660,7 @@ def _select_target_genes(
                 if control_linear_mean is None or linear_sums is None:
                     raise ValueError("logfc_threshold requires streamed normalized means")
                 perturb_linear_mean = linear_sums[perturbation_index] / max(int(counts[perturbation_index]), 1)
-                logfc = _log2_fold_change(perturb_linear_mean, control_linear_mean)
+                logfc = log2_fold_change(perturb_linear_mean, control_linear_mean)
                 candidate_indices = np.flatnonzero(np.abs(logfc) > float(logfc_threshold)).astype(np.int64, copy=False)
                 logfc_passing = int(candidate_indices.shape[0])
                 if candidate_indices.size:
@@ -727,29 +721,6 @@ def _group_counts(guides: sparse.csr_matrix, control_mask: np.ndarray) -> np.nda
     return counts
 
 
-def _iter_chunks(
-    matrix: Any,
-    *,
-    n_obs: int,
-    chunk_size: int,
-    target_sum: float,
-    gene_indices: np.ndarray | None = None,
-    clip_values: np.ndarray | None = None,
-    apply_log1p: bool = True,
-) -> Any:
-    for start in range(0, n_obs, chunk_size):
-        stop = min(start + chunk_size, n_obs)
-        if apply_log1p:
-            chunk = _log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
-        else:
-            chunk = _normalize_chunk(matrix[start:stop], target_sum=target_sum)
-        if gene_indices is not None:
-            chunk = chunk[:, gene_indices]
-        if clip_values is not None:
-            chunk = _clip_matrix_columns(chunk, clip_values)
-        yield start, stop, chunk
-
-
 def _collect_group_stats(
     matrix: Any,
     *,
@@ -789,7 +760,7 @@ def _collect_group_stats(
             raise ValueError("Cannot estimate clip values without model cells")
         hist = np.zeros((feature_count, int(clip_bins)), dtype=np.uint32)
         nonzero_counts = np.zeros(feature_count, dtype=np.int64)
-    for start, stop, chunk in _iter_chunks(
+    for start, stop, chunk in iter_matrix_chunks(
         matrix,
         n_obs=guides.shape[0],
         chunk_size=chunk_size,
@@ -803,11 +774,11 @@ def _collect_group_stats(
             if np.any(chunk_control):
                 _add_group_sums(chunk[chunk_control], row=0, sums=linear_sums)
             _add_multilabel_group_sums(chunk, guides[start:stop], sums=linear_sums)
-            chunk = _apply_log1p_chunk(chunk)
+            chunk = apply_log1p_chunk(chunk)
         if hist is not None and nonzero_counts is not None and clip_model_mask is not None:
             model_mask = clip_model_mask[start:stop]
             if np.any(model_mask):
-                _accumulate_nonzero_histogram(chunk[model_mask], hist=hist, nonzero_counts=nonzero_counts, max_value=max_value)
+                accumulate_nonzero_histogram(chunk[model_mask], hist=hist, nonzero_counts=nonzero_counts, max_value=max_value)
         if background_stats is not None:
             if cluster_codes is None:
                 raise ValueError("background_stats requires cluster_codes")
@@ -822,7 +793,7 @@ def _collect_group_stats(
     clip_values = None
     if hist is not None and nonzero_counts is not None:
         zero_counts = np.full(feature_count, clip_model_cell_count, dtype=np.int64) - nonzero_counts
-        clip_values = _histogram_quantiles(hist, zero_counts=zero_counts, total_count=clip_model_cell_count, quantile=float(clip_quantile), max_value=max_value)
+        clip_values = histogram_quantiles(hist, zero_counts=zero_counts, total_count=clip_model_cell_count, quantile=float(clip_quantile), max_value=max_value)
     return sums, squared_sums, counts, linear_sums, clip_values
 
 
@@ -849,7 +820,7 @@ def _score_single_label(
     max_score_by_perturbation = np.zeros(beta.shape[0] - 1, dtype=np.float64)
     start_time = time.perf_counter()
 
-    for start, stop, chunk in _iter_chunks(
+    for start, stop, chunk in iter_matrix_chunks(
         matrix,
         n_obs=guides.shape[0],
         chunk_size=chunk_size,
@@ -922,7 +893,7 @@ def _score_multilabel(
     valid_mask = np.zeros(guides.shape[0], dtype=bool)
     start_time = time.perf_counter()
 
-    for start, stop, chunk in _iter_chunks(
+    for start, stop, chunk in iter_matrix_chunks(
         matrix,
         n_obs=guides.shape[0],
         chunk_size=chunk_size,
@@ -995,7 +966,7 @@ def _collect_multilabel_ridge_stats(
     perturbation_counts = np.zeros(perturbation_count, dtype=np.float64)
     cooccurrence = sparse.csr_matrix((perturbation_count, perturbation_count), dtype=np.float64)
 
-    for start, stop, chunk in _iter_chunks(
+    for start, stop, chunk in iter_matrix_chunks(
         matrix,
         n_obs=guides.shape[0],
         chunk_size=chunk_size,
@@ -1015,7 +986,7 @@ def _collect_multilabel_ridge_stats(
         chunk = chunk[model_mask]
         chunk_guides = chunk_guides[model_mask]
         intercept_count += float(chunk.shape[0])
-        xty[0] += _column_sums(chunk)
+        xty[0] += column_sums(chunk)
         perturbation_counts += np.asarray(chunk_guides.sum(axis=0)).ravel().astype(np.float64, copy=False)
         cooccurrence = cooccurrence + (chunk_guides.T @ chunk_guides).tocsr()
         _add_multilabel_xty(chunk, chunk_guides, xty=xty)
@@ -1026,90 +997,6 @@ def _collect_multilabel_ridge_stats(
     )
     bottom = sparse.hstack([sparse.csr_matrix(perturbation_counts[:, None]), cooccurrence], format="csr")
     return sparse.vstack([top, bottom], format="csc"), xty
-
-
-def _normalize_chunk(matrix: Any, *, target_sum: float) -> Any:
-    if sparse.issparse(matrix):
-        work = matrix.tocsr(copy=True).astype(np.float64)
-        totals = np.asarray(work.sum(axis=1)).ravel()
-        scales = np.zeros(work.shape[0], dtype=np.float64)
-        nonzero = totals > 0
-        scales[nonzero] = target_sum / totals[nonzero]
-        return work.multiply(scales[:, None]).tocsr()
-
-    dense = np.asarray(matrix, dtype=np.float64).copy()
-    totals = dense.sum(axis=1, keepdims=True)
-    nonzero = totals[:, 0] > 0
-    dense[nonzero] *= target_sum / totals[nonzero]
-    dense[~nonzero] = 0.0
-    return dense
-
-
-def _log_normalize_chunk(matrix: Any, *, target_sum: float) -> Any:
-    return _apply_log1p_chunk(_normalize_chunk(matrix, target_sum=target_sum))
-
-
-def _apply_log1p_chunk(matrix: Any) -> Any:
-    if sparse.issparse(matrix):
-        matrix.data = np.log1p(matrix.data)
-        return matrix
-    np.log1p(matrix, out=matrix)
-    return matrix
-
-
-def _accumulate_nonzero_histogram(matrix: Any, *, hist: np.ndarray, nonzero_counts: np.ndarray, max_value: float) -> None:
-    if sparse.issparse(matrix):
-        coo = matrix.tocoo()
-        positive = coo.data > 0.0
-        if not np.any(positive):
-            return
-        columns = coo.col[positive]
-        nonzero_counts += np.bincount(columns, minlength=hist.shape[0]).astype(np.int64, copy=False)
-        np.add.at(hist, (columns, _histogram_bin_indices(coo.data[positive], bins=hist.shape[1], max_value=max_value)), 1)
-        return
-    dense = np.asarray(matrix, dtype=np.float64)
-    nonzero_rows, nonzero_cols = np.nonzero(dense > 0.0)
-    if nonzero_cols.size:
-        nonzero_counts += np.bincount(nonzero_cols, minlength=hist.shape[0]).astype(np.int64, copy=False)
-        np.add.at(hist, (nonzero_cols, _histogram_bin_indices(dense[nonzero_rows, nonzero_cols], bins=hist.shape[1], max_value=max_value)), 1)
-
-
-def _histogram_bin_indices(values: np.ndarray, *, bins: int, max_value: float) -> np.ndarray:
-    return np.clip(np.floor((np.asarray(values, dtype=np.float64) / max_value) * bins).astype(np.int64, copy=False), 0, bins - 1)
-
-
-def _histogram_quantiles(hist: np.ndarray, *, zero_counts: np.ndarray, total_count: int, quantile: float, max_value: float) -> np.ndarray:
-    edges = (np.arange(1, hist.shape[1] + 1, dtype=np.float64) * max_value) / float(hist.shape[1])
-    position = float(total_count - 1) * quantile
-    lower_rank = int(np.floor(position))
-    upper_rank = int(np.ceil(position))
-    fraction = position - float(lower_rank)
-    clip_values = np.zeros(hist.shape[0], dtype=np.float64)
-    for gene_index in range(hist.shape[0]):
-        lower = _histogram_value_at_rank(hist[gene_index], zero_count=int(zero_counts[gene_index]), rank=lower_rank, edges=edges)
-        upper = _histogram_value_at_rank(hist[gene_index], zero_count=int(zero_counts[gene_index]), rank=upper_rank, edges=edges)
-        clip_values[gene_index] = lower + fraction * (upper - lower)
-    return clip_values
-
-
-def _histogram_value_at_rank(hist_row: np.ndarray, *, zero_count: int, rank: int, edges: np.ndarray) -> float:
-    if rank < zero_count:
-        return 0.0
-    cumulative = np.cumsum(hist_row, dtype=np.int64)
-    if cumulative.size == 0 or cumulative[-1] == 0:
-        return 0.0
-    bin_index = int(np.searchsorted(cumulative, rank - zero_count + 1, side="left"))
-    return float(edges[min(bin_index, edges.shape[0] - 1)])
-
-
-def _clip_matrix_columns(matrix: Any, clip_values: np.ndarray) -> Any:
-    if sparse.issparse(matrix):
-        work = matrix.tocsr(copy=True).astype(np.float64)
-        if work.data.size:
-            work.data = np.minimum(work.data, clip_values[work.indices])
-            work.eliminate_zeros()
-        return work
-    return np.minimum(np.asarray(matrix, dtype=np.float64).copy(), clip_values[None, :])
 
 
 def _add_group_stats(matrix: Any, *, row: int, sums: np.ndarray, squared_sums: np.ndarray, counts: np.ndarray) -> None:
@@ -1124,7 +1011,7 @@ def _add_group_stats(matrix: Any, *, row: int, sums: np.ndarray, squared_sums: n
 
 
 def _add_group_sums(matrix: Any, *, row: int, sums: np.ndarray) -> None:
-    sums[row] += _column_sums(matrix)
+    sums[row] += column_sums(matrix)
 
 
 def _add_multilabel_group_stats(matrix: Any, guides: sparse.csr_matrix, *, sums: np.ndarray, squared_sums: np.ndarray, counts: np.ndarray) -> None:
@@ -1190,17 +1077,7 @@ def _add_multilabel_xty(matrix: Any, guides: sparse.csr_matrix, *, xty: np.ndarr
     columns = coo.col
     rows = coo.row
     for column in np.unique(columns):
-        xty[int(column) + 1] += _column_sums(matrix[rows[columns == column]])
-
-
-def _column_sums(matrix: Any) -> np.ndarray:
-    if sparse.issparse(matrix):
-        return np.asarray(matrix.sum(axis=0)).ravel().astype(np.float64, copy=False)
-    return np.asarray(matrix, dtype=np.float64).sum(axis=0)
-
-
-def _log2_fold_change(case_mean: np.ndarray, control_mean: np.ndarray, *, pseudocount: float = 1.0) -> np.ndarray:
-    return np.log2((np.asarray(case_mean, dtype=np.float64) + pseudocount) / (np.asarray(control_mean, dtype=np.float64) + pseudocount))
+        xty[int(column) + 1] += column_sums(matrix[rows[columns == column]])
 
 
 def _solve_single_label_ridge(
@@ -1335,40 +1212,10 @@ def _summarize_guide_multiplicity(active_counts: np.ndarray) -> dict[str, Any]:
     }
 
 
-def _ordered_union_indices(groups: Any) -> np.ndarray:
-    union: list[int] = []
-    seen: set[int] = set()
-    for group in groups:
-        for index in group:
-            key = int(index)
-            if key not in seen:
-                union.append(key)
-                seen.add(key)
-    return np.asarray(union, dtype=np.int64)
-
-
 def _write_json(value: Any, path: Path) -> None:
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(_to_jsonable(value), handle, indent=2, sort_keys=True)
+        json.dump(to_jsonable(value), handle, indent=2, sort_keys=True)
         handle.write("\n")
-
-
-def _max_rss_kb() -> int:
-    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-
-
-def _to_jsonable(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_jsonable(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (np.integer, np.floating)):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    return value
 
 
 __all__ = [
@@ -1382,4 +1229,4 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    print(json.dumps(_to_jsonable(main()), indent=2, sort_keys=True))
+    print(json.dumps(to_jsonable(main()), indent=2, sort_keys=True))
