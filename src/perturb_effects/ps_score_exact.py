@@ -8,7 +8,7 @@ large production runs should use ``ps_score_exact_fast``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 import time
 from typing import Any
 
@@ -30,6 +30,10 @@ from .utils import (
 
 
 SUPPORTED_TARGET_GENE_SOURCES = ("provided", "scanpy_de", "hvg")
+SCANPY_DE_METHOD = "wilcoxon"
+SCANPY_DE_LOGFC_THRESHOLD = 0.1
+SCANPY_DE_LOGFC_THRESHOLD_DECAY = 0.8
+SCANPY_DE_MAX_LOGFC_ROUNDS = 3
 
 
 def run_ps_score_exact_anndata(
@@ -54,7 +58,6 @@ def run_ps_score_exact_anndata(
     scale_factor: float = 3.0,
     scale_score: bool = True,
     background_cluster_column: str | None = None,
-    stage_observer: Callable[[str, str, Mapping[str, Any]], None] | None = None,
 ) -> pd.DataFrame:
     """Run the sparse in-memory R-like exact PS-score workflow on AnnData."""
 
@@ -89,69 +92,59 @@ def run_ps_score_exact_anndata(
 
     stage_timings: dict[str, float] = {}
 
-    def _run_instrumented_stage(name: str, func: Callable[[], Any]) -> Any:
-        if stage_observer is not None:
-            stage_observer(name, "start", {})
-        start = time.perf_counter()
-        try:
-            value = func()
-        except Exception as error:
-            duration = time.perf_counter() - start
-            stage_timings[name] = float(duration)
-            if stage_observer is not None:
-                stage_observer(name, "error", {"duration_seconds": float(duration), "error": str(error)})
-            raise
-        duration = time.perf_counter() - start
-        stage_timings[name] = float(duration)
-        if stage_observer is not None:
-            stage_observer(name, "end", {"duration_seconds": float(duration)})
-        return value
-
-    def _resolve_and_filter_target_genes() -> tuple[dict[str, list[str]], dict[str, Any], dict[str, Any]]:
-        if target_gene_source == "provided":
-            genes_by_perturbation = _resolve_provided_target_genes(
-                target_genes=target_genes,
-                selected_perturbations=parsed.perturbations,
-                gene_lookup=gene_lookup,
-                target_gene_min=target_gene_min,
-                target_gene_max=target_gene_max,
-            )
-            source_metadata_local = {"mode": "provided"}
-        elif target_gene_source == "hvg":
-            genes_by_perturbation = _resolve_hvg_target_genes(
-                adata,
-                hvg_key=hvg_key,
-                selected_perturbations=parsed.perturbations,
-                gene_lookup=gene_lookup,
-                target_gene_min=target_gene_min,
-                target_gene_max=target_gene_max,
-            )
-            source_metadata_local = {"mode": "hvg", "hvg_key": hvg_key}
-        else:
-            genes_by_perturbation = _resolve_scanpy_target_genes(
-                adata,
-                parsed=parsed,
-                ctrl_name=ctrl_name,
-                layer=layer,
-                gene_lookup=gene_lookup,
-                target_gene_min=target_gene_min,
-                target_gene_max=target_gene_max,
-            )
-            source_metadata_local = {"mode": "scanpy_de", "layer": layer}
-        filter_metadata_local = _filter_target_genes(
-            filter_matrix=filter_matrix,
-            control_mask=parsed.control_mask,
-            guides=parsed.guides,
+    stage_start = time.perf_counter()
+    if target_gene_source == "provided":
+        genes_by_perturbation = _resolve_provided_target_genes(
+            target_genes=target_genes,
             selected_perturbations=parsed.perturbations,
-            genes_by_perturbation=genes_by_perturbation,
             gene_lookup=gene_lookup,
             target_gene_min=target_gene_min,
-            gene_filter_min_fraction=gene_filter_min_fraction,
-            apply_gene_filter=apply_gene_filter,
+            target_gene_max=target_gene_max,
         )
-        return genes_by_perturbation, source_metadata_local, filter_metadata_local
-
-    _, source_metadata, filter_metadata = _run_instrumented_stage("target_gene_selection", _resolve_and_filter_target_genes)
+        source_metadata = {"mode": "provided"}
+    elif target_gene_source == "hvg":
+        genes_by_perturbation = _resolve_hvg_target_genes(
+            adata,
+            hvg_key=hvg_key,
+            selected_perturbations=parsed.perturbations,
+            gene_lookup=gene_lookup,
+            target_gene_min=target_gene_min,
+            target_gene_max=target_gene_max,
+        )
+        source_metadata = {"mode": "hvg", "hvg_key": hvg_key}
+    else:
+        genes_by_perturbation = _resolve_scanpy_target_genes(
+            adata,
+            parsed=parsed,
+            ctrl_name=ctrl_name,
+            layer=layer,
+            gene_lookup=gene_lookup,
+            target_gene_min=target_gene_min,
+            target_gene_max=target_gene_max,
+        )
+        source_metadata = {
+            "mode": "scanpy_de",
+            "layer": layer,
+            "method": SCANPY_DE_METHOD,
+            "logfc_threshold": SCANPY_DE_LOGFC_THRESHOLD,
+            "logfc_threshold_decay": SCANPY_DE_LOGFC_THRESHOLD_DECAY,
+            "max_logfc_rounds": SCANPY_DE_MAX_LOGFC_ROUNDS,
+            "direction": "both",
+            "rank_by": "pvals",
+        }
+    filter_metadata = _filter_target_genes(
+        filter_matrix=filter_matrix,
+        control_mask=parsed.control_mask,
+        guides=parsed.guides,
+        selected_perturbations=parsed.perturbations,
+        genes_by_perturbation=genes_by_perturbation,
+        gene_lookup=gene_lookup,
+        target_gene_min=target_gene_min,
+        gene_filter_min_fraction=gene_filter_min_fraction,
+        apply_gene_filter=apply_gene_filter,
+        require_min_genes=target_gene_source != "scanpy_de",
+    )
+    stage_timings["target_gene_selection"] = float(time.perf_counter() - stage_start)
     filtered_genes_by_perturbation = filter_metadata["genes_by_perturbation"]
     union_genes: list[str] = []
     seen_genes: set[str] = set()
@@ -160,66 +153,63 @@ def run_ps_score_exact_anndata(
             if gene not in seen_genes:
                 union_genes.append(gene)
                 seen_genes.add(gene)
+    if not union_genes:
+        raise ValueError("No target genes left after target gene selection and filtering")
     union_gene_indices = np.asarray([gene_lookup[gene] for gene in union_genes], dtype=np.int64)
 
+    stage_start = time.perf_counter()
     clip_values: np.ndarray | None = None
     background_matrix: np.ndarray | None = None
     background_control_counts: np.ndarray | None = None
 
-    def _solve_beta_stage() -> tuple[sparse.csr_matrix, np.ndarray]:
-        nonlocal clip_values, background_matrix, background_control_counts
-        y_matrix_local = expression_matrix[model_indices][:, union_gene_indices].tocsr().astype(np.float64, copy=False)
-        if apply_quantile_clip:
-            y_matrix_local, clip_values = clip_sparse_columns_by_quantile(y_matrix_local, clip_quantile)
+    y_matrix = expression_matrix[model_indices][:, union_gene_indices].tocsr().astype(np.float64, copy=False)
+    if apply_quantile_clip:
+        y_matrix, clip_values = clip_sparse_columns_by_quantile(y_matrix, clip_quantile)
 
-        design = sparse.hstack(
-            [sparse.csr_matrix(np.ones((model_guides.shape[0], 1), dtype=np.float64)), model_guides],
-            format="csr",
-            dtype=np.float64,
+    design = sparse.hstack(
+        [sparse.csr_matrix(np.ones((model_guides.shape[0], 1), dtype=np.float64)), model_guides],
+        format="csr",
+        dtype=np.float64,
+    )
+    beta = solve_ridge_beta(design, y_matrix, lr_lambda)
+
+    if cluster_codes is not None:
+        background_matrix, background_control_counts = _cluster_background_matrix(
+            y_matrix,
+            control_mask=model_control_mask,
+            cluster_codes=cluster_codes[model_indices],
+            cluster_names=cluster_names,
         )
-        beta_local = solve_ridge_beta(design, y_matrix_local, lr_lambda)
+        beta = beta.copy()
+        beta[0] = 0.0
+    stage_timings["beta_solve"] = float(time.perf_counter() - stage_start)
 
-        if cluster_codes is not None:
-            background_matrix, background_control_counts = _cluster_background_matrix(
-                y_matrix_local,
-                control_mask=model_control_mask,
-                cluster_codes=cluster_codes[model_indices],
-                cluster_names=cluster_names,
-            )
-            beta_local = beta_local.copy()
-            beta_local[0] = 0.0
-
-        return y_matrix_local, beta_local
-
-    y_matrix, beta = _run_instrumented_stage("beta_solve", _solve_beta_stage)
-
-    def _score_stage() -> tuple[pd.DataFrame, dict[str, Any]]:
-        score_values, cell_indices, perturbation_indices, valid_mask = _score_grouped_lbfgsb(
-            y_matrix=y_matrix,
-            model_indices=model_indices,
-            model_guides=model_guides,
-            beta=beta,
-            perturbations=parsed.perturbations,
-            obs_count=obs_index.shape[0],
-            score_lambda=score_lambda,
-            scale_factor=scale_factor,
-            scale_score=scale_score,
-            cluster_codes=None if cluster_codes is None else cluster_codes[model_indices],
-            background_matrix=background_matrix,
-        )
-        return ps_score_long_dataframe(
-            obs_index=obs_index,
-            control_mask=parsed.control_mask,
-            valid_mask=valid_mask,
-            scores=score_values,
-            cell_indices=cell_indices,
-            perturbation_indices=perturbation_indices,
-            perturbations=parsed.perturbations,
-            ctrl_name=ctrl_name,
-            missing_perturbation="",
-        ), {}
-
-    result, _ = _run_instrumented_stage("scoring", _score_stage)
+    stage_start = time.perf_counter()
+    score_values, cell_indices, perturbation_indices, valid_mask = _score_grouped_lbfgsb(
+        y_matrix=y_matrix,
+        model_indices=model_indices,
+        model_guides=model_guides,
+        beta=beta,
+        perturbations=parsed.perturbations,
+        obs_count=obs_index.shape[0],
+        score_lambda=score_lambda,
+        scale_factor=scale_factor,
+        scale_score=scale_score,
+        cluster_codes=None if cluster_codes is None else cluster_codes[model_indices],
+        background_matrix=background_matrix,
+    )
+    result = ps_score_long_dataframe(
+        obs_index=obs_index,
+        control_mask=parsed.control_mask,
+        valid_mask=valid_mask,
+        scores=score_values,
+        cell_indices=cell_indices,
+        perturbation_indices=perturbation_indices,
+        perturbations=parsed.perturbations,
+        ctrl_name=ctrl_name,
+        missing_perturbation="",
+    )
+    stage_timings["scoring"] = float(time.perf_counter() - stage_start)
 
     metadata = {
         "algorithm": "ps_score_exact",
@@ -349,11 +339,18 @@ def _resolve_scanpy_target_genes(
     gene_lookup: Mapping[str, int],
     target_gene_min: int,
     target_gene_max: int,
-    de_method: str = "t-test",
+    de_method: str = SCANPY_DE_METHOD,
+    logfc_threshold: float = SCANPY_DE_LOGFC_THRESHOLD,
+    logfc_threshold_decay: float = SCANPY_DE_LOGFC_THRESHOLD_DECAY,
+    max_logfc_rounds: int = SCANPY_DE_MAX_LOGFC_ROUNDS,
 ) -> dict[str, list[str]]:
     import scanpy as sc
 
     genes_by_perturbation: dict[str, list[str]] = {}
+    thresholds = [
+        float(logfc_threshold) * (float(logfc_threshold_decay) ** round_index)
+        for round_index in range(max_logfc_rounds)
+    ]
     for perturbation_index, perturbation in enumerate(parsed.perturbations):
         active = np.asarray(parsed.guides[:, perturbation_index].toarray()).ravel() > 0
         subset_mask = parsed.control_mask | active
@@ -366,14 +363,20 @@ def _resolve_scanpy_target_genes(
             reference=ctrl_name,
             use_raw=False,
             layer=layer,
-            n_genes=target_gene_max,
+            n_genes=subset.n_vars,
             method=de_method,
         )
         de_frame = sc.get.rank_genes_groups_df(subset, group="target")
-        genes = _normalize_gene_names([gene for gene in de_frame["names"].tolist() if isinstance(gene, str) and gene])
-        genes = [gene for gene in genes if gene in gene_lookup][:target_gene_max]
-        if len(genes) < target_gene_min:
-            raise ValueError(f"Scanpy DE found fewer than {target_gene_min} target genes for perturbation {perturbation!r}")
+        known_gene = de_frame["names"].isin(gene_lookup)
+        de_frame = de_frame[known_gene].copy()
+        de_frame["_abs_logfc"] = pd.to_numeric(de_frame["logfoldchanges"], errors="coerce").abs()
+        selected = de_frame.iloc[0:0]
+        for threshold in thresholds:
+            selected = de_frame[de_frame["_abs_logfc"] > threshold]
+            if selected.shape[0] >= target_gene_min:
+                break
+        selected = selected.sort_values("pvals", kind="stable")
+        genes = _normalize_gene_names(selected["names"].tolist())[:target_gene_max]
         genes_by_perturbation[str(perturbation)] = genes
     return genes_by_perturbation
 
@@ -389,6 +392,7 @@ def _filter_target_genes(
     target_gene_min: int,
     gene_filter_min_fraction: float,
     apply_gene_filter: bool,
+    require_min_genes: bool = True,
 ) -> dict[str, Any]:
     filtered: dict[str, list[str]] = {}
     counts_before: dict[str, int] = {}
@@ -406,7 +410,7 @@ def _filter_target_genes(
         candidate = filter_matrix[relevant_rows][:, gene_indices]
         keep_fraction = np.asarray(candidate.getnnz(axis=0), dtype=float).ravel() / float(candidate.shape[0])
         kept = [gene for gene, keep in zip(genes, keep_fraction >= gene_filter_min_fraction, strict=False) if keep]
-        if len(kept) < target_gene_min:
+        if require_min_genes and len(kept) < target_gene_min:
             raise ValueError(f"Gene filtering left fewer than {target_gene_min} target genes for perturbation {perturbation!r}")
         filtered[str(perturbation)] = kept
         counts_after[str(perturbation)] = len(kept)

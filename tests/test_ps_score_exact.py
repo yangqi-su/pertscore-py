@@ -375,7 +375,16 @@ def test_scanpy_target_gene_mode_selects_non_empty_genes_when_available() -> Non
     metadata = result.attrs["ps_score_exact"]
 
     assert metadata["target_gene_source"] == "scanpy_de"
-    assert metadata["target_gene_source_detail"] == {"mode": "scanpy_de", "layer": "expr"}
+    assert metadata["target_gene_source_detail"] == {
+        "mode": "scanpy_de",
+        "layer": "expr",
+        "method": "wilcoxon",
+        "logfc_threshold": 0.1,
+        "logfc_threshold_decay": 0.8,
+        "max_logfc_rounds": 3,
+        "direction": "both",
+        "rank_by": "pvals",
+    }
     assert metadata["genes_by_perturbation"]["pertA"]
     assert set(metadata["genes_by_perturbation"]["pertA"]).issubset(set(adata.var_names))
 
@@ -524,9 +533,8 @@ def test_background_correction_uses_cluster_control_baseline_during_scoring() ->
     assert result.attrs["ps_score_exact"]["background_control_cell_counts"] == {"c1": 1, "c2": 1}
 
 
-def test_exact_ps_records_stage_timings_and_observer_events() -> None:
+def test_exact_ps_records_stage_timings() -> None:
     adata = _make_target_strategy_adata()
-    events: list[tuple[str, str, dict[str, object]]] = []
 
     result = run_ps_score_exact_anndata(
         adata,
@@ -541,12 +549,9 @@ def test_exact_ps_records_stage_timings_and_observer_events() -> None:
         apply_gene_filter=False,
         apply_quantile_clip=False,
         scale_score=False,
-        stage_observer=lambda stage, event, details: events.append((stage, event, dict(details))),
     )
 
     stage_timings = result.attrs["ps_score_exact"]["stage_timings"]
 
     assert set(stage_timings) == {"target_gene_selection", "beta_solve", "scoring"}
     assert all(stage_timings[name] >= 0.0 for name in stage_timings)
-    assert [stage for stage, event, _ in events if event == "start"] == ["target_gene_selection", "beta_solve", "scoring"]
-    assert [stage for stage, event, _ in events if event == "end"] == ["target_gene_selection", "beta_solve", "scoring"]

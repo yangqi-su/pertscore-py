@@ -158,7 +158,7 @@ def test_benchmark_runner_writes_summary_and_progress_logs(tmp_path) -> None:
     }
     assert saved["result_summary"]["computation_path"] == "in_memory_sparse_lbfgsb"
     assert saved["feasibility"]["sampled_perturbation_count"] == 2
-    assert "exact_stage_event" in progress_path.read_text(encoding="utf-8")
+    assert "exact_stage_event" not in progress_path.read_text(encoding="utf-8")
 
 
 def test_benchmark_runner_supports_in_memory_hvg_mode(tmp_path) -> None:

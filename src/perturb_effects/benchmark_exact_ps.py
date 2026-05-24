@@ -548,13 +548,6 @@ def _run_benchmark_core(
     )
     layer_to_use = config.lognorm_layer if config.ensure_log1p and config.lognorm_layer else config.layer
 
-    exact_events: list[dict[str, Any]] = []
-
-    def stage_observer(stage_name: str, event: str, details: Mapping[str, Any]) -> None:
-        payload = {"stage": stage_name, "event_name": event, **dict(details)}
-        exact_events.append(payload)
-        progress.emit("exact_stage_event", **payload)
-
     result = run_ps_score_exact_anndata(
         adata,
         perturb_column=config.perturb_column,
@@ -574,7 +567,6 @@ def _run_benchmark_core(
         score_lambda=config.score_lambda,
         scale_factor=config.scale_factor,
         scale_score=config.scale_score,
-        stage_observer=stage_observer,
     )
     exact_metadata = dict(result.attrs.get("ps_score_exact", {}))
     for stage_name, seconds in exact_metadata.get("stage_timings", {}).items():
@@ -593,7 +585,6 @@ def _run_benchmark_core(
         "score_metadata": exact_metadata.get("score_metadata", {}),
         "computation_path": exact_metadata.get("computation_path"),
         "sparse_fallback_reason": exact_metadata.get("sparse_fallback_reason"),
-        "stage_events": exact_events,
     }
 
     report = {
