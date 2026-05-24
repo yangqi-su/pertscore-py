@@ -1,9 +1,9 @@
-"""Exact scMAGeCK-style PS scores for single-label AnnData inputs.
+"""In-memory sparse scMAGeCK/R-like PS score reference path.
 
-This path is exact for the single-label scMAGeCK PS-score objective after target
-genes are chosen, using an AnnData-derived design matrix, ridge LR beta solve,
-and bounded scalar scores. It does not claim Seurat `FindMarkers` parity for
-target-gene selection and does not support multi-perturbation-per-cell inputs.
+This implementation keeps the full selected AnnData matrix in memory, converts it
+to CSR, solves ridge beta from sparse sufficient statistics, and optimizes PS
+scores with grouped L-BFGS-B. It is intended as a simple R-like reference path;
+large production runs should use ``ps_score_exact_fast``.
 """
 
 from __future__ import annotations
@@ -14,24 +14,20 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy import linalg, sparse
+from scipy import sparse
+from scipy.optimize import minimize
 
-from .stream import extract_anndata_matrix
-from .utils import resolve_perturbations
+from .stats import solve_ridge_beta
+from .stream import as_csr_matrix, clip_sparse_columns_by_quantile, extract_anndata_matrix
+from .utils import (
+    PERTURBATION_DELIMITER,
+    background_cluster_codes as parse_background_cluster_codes,
+    clean_obs_labels,
+    group_rows_by_active_set,
+    parse_perturbation_labels,
+    ps_score_long_dataframe,
+)
 
-
-RESULT_COLUMNS = [
-    "row_id",
-    "perturbation_label",
-    "target_perturbation",
-    "ps_score",
-    "method",
-    "selected_target_gene_count",
-    "score_status",
-    "scale_factor",
-    "score_lambda",
-    "lr_lambda",
-]
 
 SUPPORTED_TARGET_GENE_SOURCES = ("provided", "scanpy_de", "hvg")
 
@@ -57,138 +53,96 @@ def run_ps_score_exact_anndata(
     score_lambda: float = 0.0,
     scale_factor: float = 3.0,
     scale_score: bool = True,
-    return_wide: bool = False,
+    background_cluster_column: str | None = None,
     stage_observer: Callable[[str, str, Mapping[str, Any]], None] | None = None,
 ) -> pd.DataFrame:
-    """Run the exact single-label scMAGeCK-style PS-score workflow on AnnData.
+    """Run the sparse in-memory R-like exact PS-score workflow on AnnData."""
 
-    Exactness here is limited to the masked ridge-beta-plus-bounded-score
-    objective for one perturbation label per cell after target genes are
-    resolved. This function does not add multi-guide support or full Seurat
-    target-selection parity.
-    """
-
-    if not isinstance(perturb_column, str) or not perturb_column:
-        raise ValueError("perturb_column must be a non-empty string")
-    if not isinstance(ctrl_name, str) or not ctrl_name:
-        raise ValueError("ctrl_name must be a non-empty string")
-    _validate_target_genes(target_genes)
     if target_gene_source not in SUPPORTED_TARGET_GENE_SOURCES:
         raise ValueError(f"Unsupported target_gene_source {target_gene_source!r}")
-    if not isinstance(hvg_key, str) or not hvg_key:
-        raise ValueError("hvg_key must be a non-empty string")
-    if target_gene_max < target_gene_min:
-        raise ValueError("target_gene_max must be greater than or equal to target_gene_min")
-
     if target_gene_source == "provided" and target_genes is None:
         raise ValueError("target_genes must be provided when target_gene_source='provided'")
     if target_gene_source != "provided" and target_genes is not None:
-        raise ValueError(
-            "target_genes must be None unless target_gene_source='provided'"
-        )
+        raise ValueError("target_genes must be None unless target_gene_source='provided'")
 
-    labels_all = np.asarray(adata.obs[perturb_column], dtype=object)
-    row_ids_all = np.asarray(adata.obs_names, dtype=object)
-    if labels_all.ndim != 1 or labels_all.size == 0:
-        raise ValueError("adata must contain at least one observation")
-    if row_ids_all.shape[0] != labels_all.shape[0]:
-        raise ValueError("adata.obs_names and the perturbation column must have the same length")
+    labels_all = clean_obs_labels(adata, perturb_column)
+    obs_index = np.asarray(adata.obs_names, dtype=object)
     if not np.any(labels_all == ctrl_name):
-        raise ValueError(
-            f"ctrl_name {ctrl_name!r} was not found in adata.obs[{perturb_column!r}]"
-        )
+        raise ValueError(f"ctrl_name {ctrl_name!r} was not found in adata.obs[{perturb_column!r}]")
 
-    selected_perturbations = resolve_perturbations(
-        labels_all,
-        control_label=ctrl_name,
-        perturbations=perturbations,
-    )
-    if not selected_perturbations:
-        return _empty_result(return_wide=return_wide)
-
-    cell_mask = (labels_all == ctrl_name) | np.isin(labels_all, selected_perturbations)
-    cell_indices = np.flatnonzero(cell_mask)
-    labels = labels_all[cell_mask]
-    row_ids = row_ids_all[cell_mask]
-    for perturbation in selected_perturbations:
-        if not np.any(labels == perturbation):
-            raise ValueError(f"No cells were found for perturbation {perturbation!r}")
+    parsed = parse_perturbation_labels(labels_all, mode="multilabel", ctrl_name=ctrl_name, perturbations=perturbations)
+    model_indices = np.flatnonzero(parsed.model_mask)
+    model_guides = parsed.guides[model_indices].tocsr()
+    model_control_mask = parsed.control_mask[model_indices]
 
     var_names = np.asarray(adata.var_names, dtype=object)
-    if var_names.ndim != 1 or var_names.size == 0:
-        raise ValueError("adata.var_names must be a non-empty one-dimensional sequence")
     gene_lookup = {str(gene): index for index, gene in enumerate(var_names.astype(str))}
+    expression_matrix_raw = extract_anndata_matrix(adata, layer=layer)
+    expression_matrix_format = "sparse" if sparse.issparse(expression_matrix_raw) else "dense"
+    expression_matrix = as_csr_matrix(expression_matrix_raw)
+    if apply_gene_filter and counts_layer is not None and counts_layer in adata.layers:
+        filter_matrix, filter_source = as_csr_matrix(adata.layers[counts_layer]), counts_layer
+    else:
+        filter_matrix = expression_matrix
+        filter_source = "none" if not apply_gene_filter else ("adata.X" if layer is None else layer)
+    cluster_codes, cluster_names = parse_background_cluster_codes(adata, background_cluster_column)
 
-    expression_matrix = extract_anndata_matrix(adata, layer=layer)
-    filter_matrix, filter_source = _resolve_filter_matrix(
-        adata,
-        expression_matrix=expression_matrix,
-        expression_source=_layer_name_or_default(layer),
-        counts_layer=counts_layer,
-        apply_gene_filter=apply_gene_filter,
-    )
-
-    use_sparse_closed_form, sparse_fallback_reason = _resolve_sparse_computation_mode(
-        expression_matrix=expression_matrix,
-        apply_quantile_clip=apply_quantile_clip,
-    )
-
-    x_shape = (int(labels.shape[0]), len(selected_perturbations) + 1)
-    clip_values: np.ndarray | None = None
     stage_timings: dict[str, float] = {}
 
     def _run_instrumented_stage(name: str, func: Callable[[], Any]) -> Any:
-        _notify_stage_observer(stage_observer, name, "start")
+        if stage_observer is not None:
+            stage_observer(name, "start", {})
         start = time.perf_counter()
         try:
             value = func()
         except Exception as error:
             duration = time.perf_counter() - start
             stage_timings[name] = float(duration)
-            _notify_stage_observer(
-                stage_observer,
-                name,
-                "error",
-                duration_seconds=float(duration),
-                error=str(error),
-            )
+            if stage_observer is not None:
+                stage_observer(name, "error", {"duration_seconds": float(duration), "error": str(error)})
             raise
         duration = time.perf_counter() - start
         stage_timings[name] = float(duration)
-        _notify_stage_observer(
-            stage_observer,
-            name,
-            "end",
-            duration_seconds=float(duration),
-        )
+        if stage_observer is not None:
+            stage_observer(name, "end", {"duration_seconds": float(duration)})
         return value
 
-    def _resolve_and_filter_target_genes() -> tuple[
-        dict[str, list[str]],
-        dict[str, Any],
-        dict[str, Any],
-    ]:
-        genes_by_perturbation, source_metadata_local = _resolve_target_genes_by_perturbation(
-            adata,
-            labels_all=labels_all,
-            perturb_column=perturb_column,
-            ctrl_name=ctrl_name,
-            selected_perturbations=selected_perturbations,
-            target_genes=target_genes,
-            target_gene_source=target_gene_source,
-            hvg_key=hvg_key,
-            target_gene_min=target_gene_min,
-            target_gene_max=target_gene_max,
-            layer=layer,
-            cell_mask=cell_mask,
-            gene_lookup=gene_lookup,
-        )
+    def _resolve_and_filter_target_genes() -> tuple[dict[str, list[str]], dict[str, Any], dict[str, Any]]:
+        if target_gene_source == "provided":
+            genes_by_perturbation = _resolve_provided_target_genes(
+                target_genes=target_genes,
+                selected_perturbations=parsed.perturbations,
+                gene_lookup=gene_lookup,
+                target_gene_min=target_gene_min,
+                target_gene_max=target_gene_max,
+            )
+            source_metadata_local = {"mode": "provided"}
+        elif target_gene_source == "hvg":
+            genes_by_perturbation = _resolve_hvg_target_genes(
+                adata,
+                hvg_key=hvg_key,
+                selected_perturbations=parsed.perturbations,
+                gene_lookup=gene_lookup,
+                target_gene_min=target_gene_min,
+                target_gene_max=target_gene_max,
+            )
+            source_metadata_local = {"mode": "hvg", "hvg_key": hvg_key}
+        else:
+            genes_by_perturbation = _resolve_scanpy_target_genes(
+                adata,
+                parsed=parsed,
+                ctrl_name=ctrl_name,
+                layer=layer,
+                gene_lookup=gene_lookup,
+                target_gene_min=target_gene_min,
+                target_gene_max=target_gene_max,
+            )
+            source_metadata_local = {"mode": "scanpy_de", "layer": layer}
         filter_metadata_local = _filter_target_genes(
             filter_matrix=filter_matrix,
-            cell_indices=cell_indices,
-            labels=labels,
-            ctrl_name=ctrl_name,
-            selected_perturbations=selected_perturbations,
+            control_mask=parsed.control_mask,
+            guides=parsed.guides,
+            selected_perturbations=parsed.perturbations,
             genes_by_perturbation=genes_by_perturbation,
             gene_lookup=gene_lookup,
             target_gene_min=target_gene_min,
@@ -197,124 +151,90 @@ def run_ps_score_exact_anndata(
         )
         return genes_by_perturbation, source_metadata_local, filter_metadata_local
 
-    (
-        genes_by_perturbation,
-        source_metadata,
-        filter_metadata,
-    ) = _run_instrumented_stage("target_gene_selection", _resolve_and_filter_target_genes)
+    _, source_metadata, filter_metadata = _run_instrumented_stage("target_gene_selection", _resolve_and_filter_target_genes)
     filtered_genes_by_perturbation = filter_metadata["genes_by_perturbation"]
-
-    union_genes = _ordered_union(
-        filtered_genes_by_perturbation[perturbation]
-        for perturbation in selected_perturbations
-    )
+    union_genes: list[str] = []
+    seen_genes: set[str] = set()
+    for perturbation in parsed.perturbations:
+        for gene in filtered_genes_by_perturbation[perturbation]:
+            if gene not in seen_genes:
+                union_genes.append(gene)
+                seen_genes.add(gene)
     union_gene_indices = np.asarray([gene_lookup[gene] for gene in union_genes], dtype=np.int64)
 
-    def _solve_beta_stage() -> tuple[Any, np.ndarray]:
-        nonlocal clip_values
-        if use_sparse_closed_form:
-            y_matrix_local = _select_matrix(
-                expression_matrix,
-                cell_indices,
-                union_gene_indices,
-                preserve_sparse=True,
-            )
-            beta_local = _solve_ridge_beta_sparse(
-                labels=labels,
-                selected_perturbations=selected_perturbations,
-                y_matrix=y_matrix_local,
-                lr_lambda=lr_lambda,
-            )
-            return y_matrix_local, beta_local
+    clip_values: np.ndarray | None = None
+    background_matrix: np.ndarray | None = None
+    background_control_counts: np.ndarray | None = None
 
-        y_matrix_local = _select_dense(expression_matrix, cell_indices, union_gene_indices)
+    def _solve_beta_stage() -> tuple[sparse.csr_matrix, np.ndarray]:
+        nonlocal clip_values, background_matrix, background_control_counts
+        y_matrix_local = expression_matrix[model_indices][:, union_gene_indices].tocsr().astype(np.float64, copy=False)
         if apply_quantile_clip:
-            y_matrix_local, clip_values = _clip_columns(y_matrix_local, clip_quantile)
-        x_matrix = _build_design_matrix(labels, selected_perturbations)
-        beta_local = _solve_ridge_beta(x_matrix, y_matrix_local, lr_lambda)
+            y_matrix_local, clip_values = clip_sparse_columns_by_quantile(y_matrix_local, clip_quantile)
+
+        design = sparse.hstack(
+            [sparse.csr_matrix(np.ones((model_guides.shape[0], 1), dtype=np.float64)), model_guides],
+            format="csr",
+            dtype=np.float64,
+        )
+        beta_local = solve_ridge_beta(design, y_matrix_local, lr_lambda)
+
+        if cluster_codes is not None:
+            background_matrix, background_control_counts = _cluster_background_matrix(
+                y_matrix_local,
+                control_mask=model_control_mask,
+                cluster_codes=cluster_codes[model_indices],
+                cluster_names=cluster_names,
+            )
+            beta_local = beta_local.copy()
+            beta_local[0] = 0.0
+
         return y_matrix_local, beta_local
 
     y_matrix, beta = _run_instrumented_stage("beta_solve", _solve_beta_stage)
 
-    if use_sparse_closed_form:
-        def _build_sparse_result_stage() -> tuple[pd.DataFrame, dict[str, Any]]:
-            return _build_sparse_result(
-                row_ids=row_ids,
-                labels=labels,
-                ctrl_name=ctrl_name,
-                selected_perturbations=selected_perturbations,
-                y_matrix=y_matrix,
-                beta=beta,
-                selected_target_gene_counts={
-                    perturbation: len(filtered_genes_by_perturbation[perturbation])
-                    for perturbation in selected_perturbations
-                },
-                scale_factor=scale_factor,
-                score_lambda=score_lambda,
-                lr_lambda=lr_lambda,
-                scale_score=scale_score,
-                return_wide=return_wide,
-            )
+    def _score_stage() -> tuple[pd.DataFrame, dict[str, Any]]:
+        score_values, cell_indices, perturbation_indices, valid_mask = _score_grouped_lbfgsb(
+            y_matrix=y_matrix,
+            model_indices=model_indices,
+            model_guides=model_guides,
+            beta=beta,
+            perturbations=parsed.perturbations,
+            obs_count=obs_index.shape[0],
+            score_lambda=score_lambda,
+            scale_factor=scale_factor,
+            scale_score=scale_score,
+            cluster_codes=None if cluster_codes is None else cluster_codes[model_indices],
+            background_matrix=background_matrix,
+        )
+        return ps_score_long_dataframe(
+            obs_index=obs_index,
+            control_mask=parsed.control_mask,
+            valid_mask=valid_mask,
+            scores=score_values,
+            cell_indices=cell_indices,
+            perturbation_indices=perturbation_indices,
+            perturbations=parsed.perturbations,
+            ctrl_name=ctrl_name,
+            missing_perturbation="",
+        ), {}
 
-        result, score_metadata = _run_instrumented_stage("scoring", _build_sparse_result_stage)
-    else:
-        def _build_dense_result_stage() -> tuple[pd.DataFrame, dict[str, Any]]:
-            score_matrix, score_metadata_local = _compute_scores(
-                y_matrix=y_matrix,
-                labels=labels,
-                ctrl_name=ctrl_name,
-                selected_perturbations=selected_perturbations,
-                beta=beta,
-                score_lambda=score_lambda,
-                scale_factor=scale_factor,
-                scale_score=scale_score,
-            )
-
-            if return_wide:
-                result_local = _build_wide_result(
-                    row_ids=row_ids,
-                    labels=labels,
-                    selected_perturbations=selected_perturbations,
-                    score_matrix=score_matrix,
-                )
-            else:
-                result_local = _build_long_result(
-                    row_ids=row_ids,
-                    labels=labels,
-                    ctrl_name=ctrl_name,
-                    selected_perturbations=selected_perturbations,
-                    score_matrix=score_matrix,
-                    selected_target_gene_counts={
-                        perturbation: len(filtered_genes_by_perturbation[perturbation])
-                        for perturbation in selected_perturbations
-                    },
-                    scale_factor=scale_factor,
-                    score_lambda=score_lambda,
-                    lr_lambda=lr_lambda,
-                )
-            return result_local, score_metadata_local
-
-        result, score_metadata = _run_instrumented_stage("scoring", _build_dense_result_stage)
+    result, _ = _run_instrumented_stage("scoring", _score_stage)
 
     metadata = {
         "algorithm": "ps_score_exact",
-        "input_type": "anndata-single-label",
+        "input_type": "anndata-r-like-sparse",
         "layer": layer,
         "counts_layer": counts_layer,
         "perturb_column": perturb_column,
         "ctrl_name": ctrl_name,
-        "perturbations": list(selected_perturbations),
+        "perturbation_delimiter": PERTURBATION_DELIMITER,
+        "perturbations": list(parsed.perturbations),
         "target_gene_source": target_gene_source,
         "target_gene_source_detail": source_metadata,
-        "expression_matrix_format": "sparse" if sparse.issparse(expression_matrix) else "dense",
-        "computation_path": (
-            "sparse_closed_form"
-            if use_sparse_closed_form
-            else "dense_fallback"
-            if sparse.issparse(expression_matrix)
-            else "dense"
-        ),
-        "sparse_fallback_reason": sparse_fallback_reason,
+        "expression_matrix_format": expression_matrix_format,
+        "computation_path": "in_memory_sparse_lbfgsb",
+        "sparse_fallback_reason": None,
         "target_gene_min": int(target_gene_min),
         "target_gene_max": int(target_gene_max),
         "genes_by_perturbation": filtered_genes_by_perturbation,
@@ -327,45 +247,27 @@ def run_ps_score_exact_anndata(
         "apply_quantile_clip": bool(apply_quantile_clip),
         "clip_quantile": float(clip_quantile),
         "clip_values": None if clip_values is None else clip_values.tolist(),
+        "background_correction": bool(cluster_codes is not None),
+        "background_correction_mode": "r_like_score_correction" if cluster_codes is not None else None,
+        "background_cluster_column": background_cluster_column,
         "lr_lambda": float(lr_lambda),
         "score_lambda": float(score_lambda),
         "scale_factor": float(scale_factor),
         "scale_score": bool(scale_score),
-        "x_shape": x_shape,
+        "x_shape": (int(model_guides.shape[0]), int(model_guides.shape[1] + 1)),
         "y_shape": tuple(int(value) for value in y_matrix.shape),
         "beta_shape": tuple(int(value) for value in beta.shape),
+        "model_cell_count": int(model_indices.shape[0]),
+        "score_output_format": "csv_long",
         "stage_timings": stage_timings,
-        "score_metadata": score_metadata,
     }
+    if background_control_counts is not None:
+        metadata["background_cluster_count"] = int(len(cluster_names))
+        metadata["background_control_cell_counts"] = {
+            name: int(background_control_counts[index]) for index, name in enumerate(cluster_names)
+        }
     result.attrs["ps_score_exact"] = metadata
     return result
-
-
-def _notify_stage_observer(
-    observer: Callable[[str, str, Mapping[str, Any]], None] | None,
-    stage_name: str,
-    event: str,
-    **details: Any,
-) -> None:
-    if observer is None:
-        return
-    observer(stage_name, event, details)
-
-
-def _validate_target_genes(
-    target_genes: Mapping[str, Sequence[str]] | Sequence[str] | None,
-) -> None:
-    if target_genes is None:
-        return
-    if isinstance(target_genes, str):
-        raise TypeError("target_genes must be a mapping or sequence of gene names, not a string")
-    if isinstance(target_genes, Mapping):
-        for key, genes in target_genes.items():
-            if not isinstance(key, str) or not key:
-                raise TypeError("target_genes mapping keys must be non-empty strings")
-            _normalize_gene_names(genes)
-        return
-    _normalize_gene_names(target_genes)
 
 
 def _normalize_gene_names(genes: Sequence[str]) -> list[str]:
@@ -383,75 +285,6 @@ def _normalize_gene_names(genes: Sequence[str]) -> list[str]:
     return normalized
 
 
-def _resolve_filter_matrix(
-    adata: Any,
-    *,
-    expression_matrix: Any,
-    expression_source: str,
-    counts_layer: str | None,
-    apply_gene_filter: bool,
-) -> tuple[Any, str]:
-    if not apply_gene_filter:
-        return expression_matrix, "none"
-    if counts_layer is not None and counts_layer in adata.layers:
-        return adata.layers[counts_layer], counts_layer
-    return expression_matrix, expression_source
-
-
-def _layer_name_or_default(layer: str | None) -> str:
-    return "adata.X" if layer is None else layer
-
-
-def _resolve_target_genes_by_perturbation(
-    adata: Any,
-    *,
-    labels_all: np.ndarray,
-    perturb_column: str,
-    ctrl_name: str,
-    selected_perturbations: Sequence[str],
-    target_genes: Mapping[str, Sequence[str]] | Sequence[str] | None,
-    target_gene_source: str,
-    hvg_key: str,
-    target_gene_min: int,
-    target_gene_max: int,
-    layer: str | None,
-    cell_mask: np.ndarray,
-    gene_lookup: Mapping[str, int],
-) -> tuple[dict[str, list[str]], dict[str, Any]]:
-    if target_gene_source == "provided":
-        genes = _resolve_provided_target_genes(
-            target_genes=target_genes,
-            selected_perturbations=selected_perturbations,
-            gene_lookup=gene_lookup,
-            target_gene_min=target_gene_min,
-            target_gene_max=target_gene_max,
-        )
-        return genes, {"mode": "provided"}
-    if target_gene_source == "hvg":
-        genes = _resolve_hvg_target_genes(
-            adata,
-            hvg_key=hvg_key,
-            selected_perturbations=selected_perturbations,
-            gene_lookup=gene_lookup,
-            target_gene_min=target_gene_min,
-            target_gene_max=target_gene_max,
-        )
-        return genes, {"mode": "hvg", "hvg_key": hvg_key}
-    genes = _resolve_scanpy_target_genes(
-        adata,
-        labels_all=labels_all,
-        perturb_column=perturb_column,
-        ctrl_name=ctrl_name,
-        selected_perturbations=selected_perturbations,
-        layer=layer,
-        cell_mask=cell_mask,
-        gene_lookup=gene_lookup,
-        target_gene_min=target_gene_min,
-        target_gene_max=target_gene_max,
-    )
-    return genes, {"mode": "scanpy_de", "layer": layer}
-
-
 def _resolve_provided_target_genes(
     *,
     target_genes: Mapping[str, Sequence[str]] | Sequence[str] | None,
@@ -462,24 +295,15 @@ def _resolve_provided_target_genes(
 ) -> dict[str, list[str]]:
     genes_by_perturbation: dict[str, list[str]] = {}
     for perturbation in selected_perturbations:
-        provided = _get_provided_genes(target_genes, perturbation=perturbation)
+        provided = target_genes.get(perturbation, target_genes.get(str(perturbation))) if isinstance(target_genes, Mapping) else target_genes
         if provided is None:
-            raise ValueError(
-                f"No target genes were provided for perturbation {perturbation!r}"
-            )
-        genes = _normalize_gene_names(provided)
-        if len(genes) > target_gene_max:
-            genes = genes[:target_gene_max]
+            raise ValueError(f"No target genes were provided for perturbation {perturbation!r}")
+        genes = _normalize_gene_names(provided)[:target_gene_max]
         if len(genes) < target_gene_min:
-            raise ValueError(
-                f"Need at least {target_gene_min} target genes for perturbation {perturbation!r}"
-            )
+            raise ValueError(f"Need at least {target_gene_min} target genes for perturbation {perturbation!r}")
         missing = [gene for gene in genes if gene not in gene_lookup]
         if missing:
-            joined = ", ".join(sorted(missing))
-            raise ValueError(
-                f"Unknown target genes requested for perturbation {perturbation!r}: {joined}"
-            )
+            raise ValueError(f"Unknown target genes requested for perturbation {perturbation!r}: " + ", ".join(sorted(missing)))
         genes_by_perturbation[str(perturbation)] = genes
     return genes_by_perturbation
 
@@ -496,9 +320,6 @@ def _resolve_hvg_target_genes(
     if hvg_key not in adata.var:
         raise ValueError(f"HVG key {hvg_key!r} was not found in adata.var")
     values = np.asarray(adata.var[hvg_key])
-    if values.ndim != 1:
-        raise ValueError(f"adata.var[{hvg_key!r}] must be one-dimensional")
-
     if np.issubdtype(values.dtype, np.bool_):
         selected_indices = np.flatnonzero(values)
     else:
@@ -507,95 +328,61 @@ def _resolve_hvg_target_genes(
         if not valid_mask.any():
             raise ValueError(f"adata.var[{hvg_key!r}] does not contain any HVG entries")
         valid_indices = np.flatnonzero(valid_mask)
-        order = np.argsort(numeric.to_numpy()[valid_indices], kind="stable")
-        selected_indices = valid_indices[order]
-
+        selected_indices = valid_indices[np.argsort(numeric.to_numpy()[valid_indices], kind="stable")]
     if selected_indices.size == 0:
         raise ValueError(f"adata.var[{hvg_key!r}] does not contain any HVGs")
-
     genes = [str(adata.var_names[index]) for index in selected_indices[:target_gene_max]]
     if len(genes) < target_gene_min:
         raise ValueError(f"Need at least {target_gene_min} HVGs from adata.var[{hvg_key!r}]")
     missing = [gene for gene in genes if gene not in gene_lookup]
     if missing:
-        joined = ", ".join(sorted(missing))
-        raise ValueError(f"Resolved HVG genes were missing from adata.var_names: {joined}")
+        raise ValueError("Resolved HVG genes were missing from adata.var_names: " + ", ".join(sorted(missing)))
     return {str(perturbation): list(genes) for perturbation in selected_perturbations}
 
 
 def _resolve_scanpy_target_genes(
     adata: Any,
     *,
-    labels_all: np.ndarray,
-    perturb_column: str,
+    parsed: Any,
     ctrl_name: str,
-    selected_perturbations: Sequence[str],
     layer: str | None,
-    cell_mask: np.ndarray,
     gene_lookup: Mapping[str, int],
     target_gene_min: int,
     target_gene_max: int,
-    de_method: str = 't-test'
+    de_method: str = "t-test",
 ) -> dict[str, list[str]]:
-    try:
-        import scanpy as sc
-    except ImportError as error:  # pragma: no cover - exercised in Phase 3
-        raise ImportError(
-            "target_gene_source='scanpy_de' requires scanpy to be installed"
-        ) from error
-
-    subset = adata[cell_mask].copy()
-    subset_labels = np.asarray(labels_all[cell_mask], dtype=object)
-    if not np.any(subset_labels == ctrl_name):
-        raise ValueError("Selected AnnData subset does not contain any control cells")
-    sc.tl.rank_genes_groups(
-        subset,
-        groupby=perturb_column,
-        groups=list(selected_perturbations),
-        reference=ctrl_name,
-        use_raw=False,
-        layer=layer,
-        n_genes=target_gene_max,
-        method = de_method
-    )
+    import scanpy as sc
 
     genes_by_perturbation: dict[str, list[str]] = {}
-    for perturbation in selected_perturbations:
-        de_frame = sc.get.rank_genes_groups_df(subset, group=perturbation)
-        if "names" not in de_frame.columns:
-            raise ValueError("scanpy rank_genes_groups output does not contain a 'names' column")
-        genes = _normalize_gene_names(
-            [gene for gene in de_frame["names"].tolist() if isinstance(gene, str) and gene]
+    for perturbation_index, perturbation in enumerate(parsed.perturbations):
+        active = np.asarray(parsed.guides[:, perturbation_index].toarray()).ravel() > 0
+        subset_mask = parsed.control_mask | active
+        subset = adata[subset_mask].copy()
+        subset.obs["_ps_score_exact_de_group"] = np.where(active[subset_mask], "target", ctrl_name)
+        sc.tl.rank_genes_groups(
+            subset,
+            groupby="_ps_score_exact_de_group",
+            groups=["target"],
+            reference=ctrl_name,
+            use_raw=False,
+            layer=layer,
+            n_genes=target_gene_max,
+            method=de_method,
         )
+        de_frame = sc.get.rank_genes_groups_df(subset, group="target")
+        genes = _normalize_gene_names([gene for gene in de_frame["names"].tolist() if isinstance(gene, str) and gene])
         genes = [gene for gene in genes if gene in gene_lookup][:target_gene_max]
         if len(genes) < target_gene_min:
-            raise ValueError(
-                f"Scanpy DE found fewer than {target_gene_min} target genes for perturbation {perturbation!r}"
-            )
+            raise ValueError(f"Scanpy DE found fewer than {target_gene_min} target genes for perturbation {perturbation!r}")
         genes_by_perturbation[str(perturbation)] = genes
     return genes_by_perturbation
 
 
-def _get_provided_genes(
-    target_genes: Mapping[str, Sequence[str]] | Sequence[str] | None,
-    *,
-    perturbation: str,
-) -> Sequence[str] | None:
-    if target_genes is None:
-        return None
-    if isinstance(target_genes, Mapping):
-        if perturbation in target_genes:
-            return target_genes[perturbation]
-        return target_genes.get(str(perturbation))
-    return target_genes
-
-
 def _filter_target_genes(
     *,
-    filter_matrix: Any,
-    cell_indices: np.ndarray,
-    labels: np.ndarray,
-    ctrl_name: str,
+    filter_matrix: sparse.csr_matrix,
+    control_mask: np.ndarray,
+    guides: sparse.csr_matrix,
     selected_perturbations: Sequence[str],
     genes_by_perturbation: Mapping[str, Sequence[str]],
     gene_lookup: Mapping[str, int],
@@ -606,40 +393,23 @@ def _filter_target_genes(
     filtered: dict[str, list[str]] = {}
     counts_before: dict[str, int] = {}
     counts_after: dict[str, int] = {}
-
-    for perturbation in selected_perturbations:
+    for perturbation_index, perturbation in enumerate(selected_perturbations):
         genes = list(genes_by_perturbation[str(perturbation)])
         counts_before[str(perturbation)] = len(genes)
         if not apply_gene_filter:
             filtered[str(perturbation)] = genes
             counts_after[str(perturbation)] = len(genes)
             continue
-
-        relevant_rows = np.flatnonzero((labels == ctrl_name) | (labels == perturbation))
+        active = np.asarray(guides[:, perturbation_index].toarray()).ravel() > 0
+        relevant_rows = np.flatnonzero(control_mask | active)
         gene_indices = np.asarray([gene_lookup[gene] for gene in genes], dtype=np.int64)
-        if sparse.issparse(filter_matrix):
-            candidate = _select_matrix(
-                filter_matrix,
-                cell_indices[relevant_rows],
-                gene_indices,
-                preserve_sparse=True,
-            )
-            keep_fraction = (
-                np.asarray(candidate.getnnz(axis=0), dtype=float).ravel() / float(candidate.shape[0])
-            )
-        else:
-            candidate = _select_dense(filter_matrix, cell_indices[relevant_rows], gene_indices)
-            keep_fraction = (candidate > 0).mean(axis=0)
-        keep_mask = keep_fraction >= gene_filter_min_fraction
-        kept = [gene for gene, keep in zip(genes, keep_mask, strict=False) if keep]
+        candidate = filter_matrix[relevant_rows][:, gene_indices]
+        keep_fraction = np.asarray(candidate.getnnz(axis=0), dtype=float).ravel() / float(candidate.shape[0])
+        kept = [gene for gene, keep in zip(genes, keep_fraction >= gene_filter_min_fraction, strict=False) if keep]
         if len(kept) < target_gene_min:
-            raise ValueError(
-                "Gene filtering left fewer than "
-                f"{target_gene_min} target genes for perturbation {perturbation!r}"
-            )
+            raise ValueError(f"Gene filtering left fewer than {target_gene_min} target genes for perturbation {perturbation!r}")
         filtered[str(perturbation)] = kept
         counts_after[str(perturbation)] = len(kept)
-
     return {
         "genes_by_perturbation": filtered,
         "target_gene_counts_before_filter": counts_before,
@@ -647,308 +417,128 @@ def _filter_target_genes(
     }
 
 
-def _ordered_union(groups: Any) -> list[str]:
-    union: list[str] = []
-    seen: set[str] = set()
-    for genes in groups:
-        for gene in genes:
-            if gene in seen:
-                continue
-            union.append(gene)
-            seen.add(gene)
-    return union
-
-
-def _resolve_sparse_computation_mode(
+def _cluster_background_matrix(
+    y_matrix: sparse.csr_matrix,
     *,
-    expression_matrix: Any,
-    apply_quantile_clip: bool,
-) -> tuple[bool, str | None]:
-    if not sparse.issparse(expression_matrix):
-        return False, None
-    if apply_quantile_clip:
-        return False, "apply_quantile_clip=True"
-    return True, None
+    control_mask: np.ndarray,
+    cluster_codes: np.ndarray,
+    cluster_names: Sequence[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    needed_clusters = np.unique(cluster_codes)
+    control_counts = np.zeros(len(cluster_names), dtype=np.int64)
+    background = np.zeros((len(cluster_names), y_matrix.shape[1]), dtype=np.float64)
+    for cluster in needed_clusters:
+        cluster_control = control_mask & (cluster_codes == cluster)
+        control_counts[int(cluster)] = int(np.count_nonzero(cluster_control))
+        if control_counts[int(cluster)] == 0:
+            raise ValueError("background correction requires control cells in each modeled cluster: " + cluster_names[int(cluster)])
+        background[int(cluster)] = np.asarray(y_matrix[cluster_control].sum(axis=0), dtype=np.float64).ravel() / float(control_counts[int(cluster)])
+    return background, control_counts
 
 
-def _select_matrix(
-    matrix: Any,
-    row_indices: np.ndarray,
-    col_indices: np.ndarray | None,
+def _score_grouped_lbfgsb(
     *,
-    preserve_sparse: bool = False,
-) -> Any:
-    if sparse.issparse(matrix):
-        subset = matrix[row_indices] if col_indices is None else matrix[row_indices][:, col_indices]
-        sparse_subset = subset.tocsr().astype(float, copy=False)
-        if preserve_sparse:
-            return sparse_subset
-        return sparse_subset
-    dense = np.asarray(matrix, dtype=float)
-    if dense.ndim != 2:
-        raise ValueError("selected matrix must be two-dimensional")
-    if col_indices is None:
-        return np.asarray(dense[row_indices], dtype=float)
-    return np.asarray(dense[np.ix_(row_indices, col_indices)], dtype=float)
-
-
-def _select_dense(
-    matrix: Any,
-    row_indices: np.ndarray,
-    col_indices: np.ndarray | None,
-) -> np.ndarray:
-    selected = _select_matrix(matrix, row_indices, col_indices)
-    if sparse.issparse(selected):
-        return np.asarray(selected.toarray(), dtype=float)
-    return np.asarray(selected, dtype=float)
-
-
-def _clip_columns(matrix: np.ndarray, quantile: float) -> tuple[np.ndarray, np.ndarray]:
-    clip_values = np.quantile(matrix, quantile, axis=0)
-    clipped = np.minimum(matrix, clip_values)
-    return clipped, np.asarray(clip_values, dtype=float)
-
-
-def _build_design_matrix(labels: np.ndarray, selected_perturbations: Sequence[str]) -> np.ndarray:
-    x_matrix = np.ones((labels.shape[0], len(selected_perturbations) + 1), dtype=float)
-    for column_index, perturbation in enumerate(selected_perturbations, start=1):
-        x_matrix[:, column_index] = (labels == perturbation).astype(float)
-    return x_matrix
-
-
-def _solve_ridge_beta(x_matrix: np.ndarray, y_matrix: np.ndarray, lr_lambda: float) -> np.ndarray:
-    gram = x_matrix.T @ x_matrix
-    rhs = x_matrix.T @ y_matrix
-    return _solve_ridge_beta_from_gram_rhs(gram=gram, rhs=rhs, lr_lambda=lr_lambda)
-
-
-def _solve_ridge_beta_sparse(
-    *,
-    labels: np.ndarray,
-    selected_perturbations: Sequence[str],
-    y_matrix: sparse.spmatrix,
-    lr_lambda: float,
-) -> np.ndarray:
-    rhs_rows = [np.asarray(y_matrix.sum(axis=0), dtype=float).ravel()]
-    gram = np.zeros((len(selected_perturbations) + 1, len(selected_perturbations) + 1), dtype=float)
-    gram[0, 0] = float(labels.shape[0])
-
-    for column_index, perturbation in enumerate(selected_perturbations, start=1):
-        target_rows = np.flatnonzero(labels == perturbation)
-        target_count = float(target_rows.size)
-        gram[0, column_index] = target_count
-        gram[column_index, 0] = target_count
-        gram[column_index, column_index] = target_count
-        rhs_rows.append(np.asarray(y_matrix[target_rows].sum(axis=0), dtype=float).ravel())
-
-    rhs = np.vstack(rhs_rows)
-    return _solve_ridge_beta_from_gram_rhs(gram=gram, rhs=rhs, lr_lambda=lr_lambda)
-
-
-def _solve_ridge_beta_from_gram_rhs(*, gram: np.ndarray, rhs: np.ndarray, lr_lambda: float) -> np.ndarray:
-    ridge = gram + lr_lambda * np.eye(gram.shape[0], dtype=float)
-    try:
-        factor = linalg.cho_factor(ridge, lower=True, check_finite=True)
-    except linalg.LinAlgError as error:
-        try:
-            return np.asarray(
-                linalg.solve(ridge, rhs, assume_a="sym", check_finite=True),
-                dtype=float,
-            )
-        except linalg.LinAlgError as fallback_error:
-            raise ValueError(
-                "Ridge system is not solvable with cholesky or default solve"
-            ) from fallback_error
-    return np.asarray(linalg.cho_solve(factor, rhs, check_finite=True), dtype=float)
-
-
-def _build_sparse_result(
-    *,
-    row_ids: np.ndarray,
-    labels: np.ndarray,
-    ctrl_name: str,
-    selected_perturbations: Sequence[str],
-    y_matrix: sparse.spmatrix,
+    y_matrix: sparse.csr_matrix,
+    model_indices: np.ndarray,
+    model_guides: sparse.csr_matrix,
     beta: np.ndarray,
-    selected_target_gene_counts: Mapping[str, int],
-    scale_factor: float,
+    perturbations: Sequence[str],
+    obs_count: int,
     score_lambda: float,
-    lr_lambda: float,
+    scale_factor: float,
     scale_score: bool,
-    return_wide: bool,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    metadata: dict[str, Any] = {}
-    control_mask = labels == ctrl_name
-    wide_matrix = (
-        np.zeros((labels.shape[0], len(selected_perturbations)), dtype=float) if return_wide else None
-    )
-    frames: list[pd.DataFrame] = []
+    cluster_codes: np.ndarray | None,
+    background_matrix: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    score_values: list[np.ndarray] = []
+    cell_index_values: list[np.ndarray] = []
+    perturbation_index_values: list[np.ndarray] = []
+    max_score_by_perturbation = np.zeros(len(perturbations), dtype=np.float64)
+    valid_mask = np.zeros(obs_count, dtype=bool)
 
-    baseline = np.asarray(beta[0], dtype=float)
-
-    for column_index, perturbation in enumerate(selected_perturbations):
-        target_mask = labels == perturbation
-        target_rows = np.flatnonzero(target_mask)
-        perturbation_beta = np.asarray(beta[column_index + 1], dtype=float)
-        beta_norm_sq = float(np.dot(perturbation_beta, perturbation_beta))
-        if beta_norm_sq <= 0:
-            raise ValueError(f"Perturbation {perturbation!r} produced a zero beta vector")
-
-        projected = np.asarray(y_matrix[target_rows] @ perturbation_beta, dtype=float).ravel()
-        baseline_projection = float(np.dot(baseline, perturbation_beta))
-        scores = np.clip(
-            (projected - baseline_projection - score_lambda) / beta_norm_sq,
-            0.0,
-            scale_factor,
-        ) / scale_factor
-        max_before_scaling = float(scores.max(initial=0.0))
-        if scale_score and max_before_scaling > 0:
-            scores = scores / max_before_scaling
-
-        if return_wide:
-            assert wide_matrix is not None
-            wide_matrix[target_rows, column_index] = scores
+    for active_set, local_rows in group_rows_by_active_set(model_guides).items():
+        active_indices = np.asarray(active_set, dtype=np.int64)
+        active_beta = beta[active_indices + 1]
+        gram = active_beta @ active_beta.T
+        rhs = np.asarray(y_matrix[local_rows] @ active_beta.T, dtype=np.float64)
+        if background_matrix is None:
+            rhs -= (beta[0] @ active_beta.T)[None, :]
         else:
-            combined_mask = control_mask | target_mask
-            combined_labels = labels[combined_mask]
-            combined_scores = np.zeros(combined_mask.sum(), dtype=float)
-            combined_scores[combined_labels == perturbation] = scores
-            frames.append(
-                pd.DataFrame(
-                    {
-                        "row_id": row_ids[combined_mask],
-                        "perturbation_label": combined_labels,
-                        "target_perturbation": perturbation,
-                        "ps_score": combined_scores,
-                        "method": "ps_score_exact",
-                        "selected_target_gene_count": int(
-                            selected_target_gene_counts[str(perturbation)]
-                        ),
-                        "score_status": np.where(
-                            combined_labels == ctrl_name,
-                            "control-zero",
-                            "optimized-active",
-                        ),
-                        "scale_factor": float(scale_factor),
-                        "score_lambda": float(score_lambda),
-                        "lr_lambda": float(lr_lambda),
-                    }
-                ).loc[:, RESULT_COLUMNS]
-            )
+            if cluster_codes is None:
+                raise ValueError("background scoring requires cluster codes")
+            rhs -= background_matrix[cluster_codes[local_rows]] @ active_beta.T
 
-        metadata[str(perturbation)] = {
-            "beta_norm_sq": beta_norm_sq,
-            "control_count": int(np.sum(control_mask)),
-            "target_count": int(target_rows.size),
-            "max_score_before_column_scale": max_before_scaling,
-            "column_scaled": bool(scale_score and max_before_scaling > 0),
-        }
-
-    if return_wide:
-        assert wide_matrix is not None
-        return (
-            _build_wide_result(
-                row_ids=row_ids,
-                labels=labels,
-                selected_perturbations=selected_perturbations,
-                score_matrix=wide_matrix,
-            ),
-            metadata,
+        bounded = _solve_bounded_quadratic_lbfgsb(
+            gram=gram,
+            rhs=rhs,
+            linear_penalty=float(score_lambda),
+            upper=float(scale_factor),
         )
-    if not frames:
-        return _empty_result(return_wide=False), metadata
-    return pd.concat(frames, ignore_index=True), metadata
+        normalized = bounded / float(scale_factor)
+        global_rows = model_indices[local_rows]
+        valid_mask[global_rows] = True
+
+        for offset, perturbation_index in enumerate(active_indices):
+            values = normalized[:, offset].astype(np.float64, copy=False)
+            score_values.append(values)
+            cell_index_values.append(global_rows.copy())
+            perturbation_index_values.append(np.full(values.shape[0], int(perturbation_index), dtype=np.int32))
+            if values.size:
+                max_score_by_perturbation[perturbation_index] = max(max_score_by_perturbation[perturbation_index], float(np.max(values)))
+
+    if score_values:
+        scores = np.concatenate(score_values).astype(np.float64, copy=False)
+        cell_indices = np.concatenate(cell_index_values).astype(np.int64, copy=False)
+        perturbation_indices = np.concatenate(perturbation_index_values).astype(np.int32, copy=False)
+    else:
+        scores = np.zeros(0, dtype=np.float64)
+        cell_indices = np.zeros(0, dtype=np.int64)
+        perturbation_indices = np.zeros(0, dtype=np.int32)
+
+    if scale_score and scores.size:
+        row_max = max_score_by_perturbation[perturbation_indices]
+        nonzero = row_max > 0.0
+        scores[nonzero] /= row_max[nonzero]
+        scores[~nonzero] = 0.0
+
+    return scores, cell_indices, perturbation_indices, valid_mask
 
 
-def _compute_scores(
+def _solve_bounded_quadratic_lbfgsb(
     *,
-    y_matrix: np.ndarray,
-    labels: np.ndarray,
-    ctrl_name: str,
-    selected_perturbations: Sequence[str],
-    beta: np.ndarray,
-    score_lambda: float,
-    scale_factor: float,
-    scale_score: bool,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    score_matrix = np.zeros((labels.shape[0], len(selected_perturbations)), dtype=float)
-    baseline = beta[0]
-    metadata: dict[str, Any] = {}
+    gram: np.ndarray,
+    rhs: np.ndarray,
+    linear_penalty: float,
+    upper: float,
+) -> np.ndarray:
+    rhs = np.asarray(rhs, dtype=np.float64)
+    if rhs.ndim == 1:
+        rhs = rhs[:, None]
+    row_count, variable_count = rhs.shape
+    initial = np.ones((row_count, variable_count), dtype=np.float64)
+    initial = np.clip(initial, 0.0, upper)
 
-    for column_index, perturbation in enumerate(selected_perturbations):
-        target_mask = labels == perturbation
-        perturbation_beta = beta[column_index + 1]
-        beta_norm_sq = float(np.dot(perturbation_beta, perturbation_beta))
-        if beta_norm_sq <= 0:
-            raise ValueError(f"Perturbation {perturbation!r} produced a zero beta vector")
-        if target_mask.any():
-            centered = y_matrix[target_mask] - baseline
-            raw = (centered @ perturbation_beta - score_lambda) / beta_norm_sq
-            bounded = np.clip(raw, 0.0, scale_factor)
-            score_matrix[target_mask, column_index] = bounded / scale_factor
-        max_before_scaling = float(score_matrix[:, column_index].max(initial=0.0))
-        if scale_score and max_before_scaling > 0:
-            score_matrix[:, column_index] = score_matrix[:, column_index] / max_before_scaling
-        metadata[str(perturbation)] = {
-            "beta_norm_sq": beta_norm_sq,
-            "control_count": int(np.sum(labels == ctrl_name)),
-            "target_count": int(np.sum(target_mask)),
-            "max_score_before_column_scale": max_before_scaling,
-            "column_scaled": bool(scale_score and max_before_scaling > 0),
-        }
-
-    return score_matrix, metadata
-
-
-def _build_long_result(
-    *,
-    row_ids: np.ndarray,
-    labels: np.ndarray,
-    ctrl_name: str,
-    selected_perturbations: Sequence[str],
-    score_matrix: np.ndarray,
-    selected_target_gene_counts: Mapping[str, int],
-    scale_factor: float,
-    score_lambda: float,
-    lr_lambda: float,
-) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
-    for column_index, perturbation in enumerate(selected_perturbations):
-        mask = (labels == ctrl_name) | (labels == perturbation)
-        score_status = np.where(labels[mask] == ctrl_name, "control-zero", "optimized-active")
-        frame = pd.DataFrame(
-            {
-                "row_id": row_ids[mask],
-                "perturbation_label": labels[mask],
-                "target_perturbation": perturbation,
-                "ps_score": score_matrix[mask, column_index],
-                "method": "ps_score_exact",
-                "selected_target_gene_count": int(selected_target_gene_counts[str(perturbation)]),
-                "score_status": score_status,
-                "scale_factor": float(scale_factor),
-                "score_lambda": float(score_lambda),
-                "lr_lambda": float(lr_lambda),
-            }
+    def objective(flat_scores: np.ndarray) -> float:
+        scores = flat_scores.reshape(row_count, variable_count)
+        return float(
+            0.5 * np.sum((scores @ gram) * scores)
+            - np.sum(rhs * scores)
+            + linear_penalty * np.sum(scores)
         )
-        frames.append(frame.loc[:, RESULT_COLUMNS])
-    if not frames:
-        return _empty_result(return_wide=False)
-    return pd.concat(frames, ignore_index=True)
+
+    def gradient(flat_scores: np.ndarray) -> np.ndarray:
+        scores = flat_scores.reshape(row_count, variable_count)
+        return (scores @ gram - rhs + linear_penalty).ravel()
+
+    result = minimize(
+        objective,
+        initial.ravel(),
+        jac=gradient,
+        bounds=[(0.0, upper)] * initial.size,
+        method="L-BFGS-B",
+    )
+    scores = np.clip(result.x.reshape(row_count, variable_count), 0.0, upper)
+    return scores
 
 
-def _build_wide_result(
-    *,
-    row_ids: np.ndarray,
-    labels: np.ndarray,
-    selected_perturbations: Sequence[str],
-    score_matrix: np.ndarray,
-) -> pd.DataFrame:
-    frame = pd.DataFrame(score_matrix, index=pd.Index(row_ids, name="row_id"), columns=selected_perturbations)
-    frame.insert(0, "perturbation_label", labels)
-    return frame
-
-
-def _empty_result(*, return_wide: bool) -> pd.DataFrame:
-    if return_wide:
-        return pd.DataFrame(columns=["perturbation_label"])
-    return pd.DataFrame(columns=RESULT_COLUMNS)
+__all__ = ["run_ps_score_exact_anndata"]

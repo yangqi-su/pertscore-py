@@ -115,10 +115,10 @@ def test_phase7_smoke_public_exact_ps_api_supports_provided_and_hvg_targets() ->
 
     assert not provided.empty
     assert not hvg.empty
-    assert set(provided["method"]) == {"ps_score_exact"}
-    assert set(provided["target_perturbation"]) == {"pert-a"}
+    assert list(provided.columns) == ["obs_index", "ps_score", "perturbation"]
+    assert set(provided["perturbation"]) == {"control", "pert-a", ""}
     assert np.allclose(
-        provided.loc[provided["perturbation_label"] == "control", "ps_score"],
+        provided.loc[provided["perturbation"] == "control", "ps_score"],
         0.0,
     )
     assert provided.attrs["ps_score_exact"]["target_gene_source"] == "provided"

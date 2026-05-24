@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from scipy import sparse
+from scipy import linalg, sparse
 
 from .types import StreamFeatureStats
 
@@ -94,3 +94,26 @@ def column_sums(matrix: Any) -> np.ndarray:
 
 def log2_fold_change(case_mean: np.ndarray, control_mean: np.ndarray, *, pseudocount: float = 1.0) -> np.ndarray:
     return np.log2((np.asarray(case_mean, dtype=np.float64) + pseudocount) / (np.asarray(control_mean, dtype=np.float64) + pseudocount))
+
+
+def solve_ridge_beta(x_matrix: Any, y_matrix: Any, lr_lambda: float) -> np.ndarray:
+    gram = x_matrix.T @ x_matrix
+    rhs = x_matrix.T @ y_matrix
+    if sparse.issparse(gram):
+        gram = gram.toarray()
+    if sparse.issparse(rhs):
+        rhs = rhs.toarray()
+    return solve_ridge_from_gram_rhs(
+        gram=np.asarray(gram, dtype=np.float64),
+        rhs=np.asarray(rhs, dtype=np.float64),
+        lr_lambda=lr_lambda,
+    )
+
+
+def solve_ridge_from_gram_rhs(*, gram: np.ndarray, rhs: np.ndarray, lr_lambda: float) -> np.ndarray:
+    ridge = gram + lr_lambda * np.eye(gram.shape[0], dtype=np.float64)
+    try:
+        factor = linalg.cho_factor(ridge, lower=True, check_finite=True)
+    except linalg.LinAlgError:
+        return np.asarray(linalg.solve(ridge, rhs, assume_a="sym", check_finite=True), dtype=np.float64)
+    return np.asarray(linalg.cho_solve(factor, rhs, check_finite=True), dtype=np.float64)

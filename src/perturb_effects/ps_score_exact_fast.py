@@ -20,7 +20,6 @@ from typing import Any, Literal
 
 import anndata as ad
 import numpy as np
-import pandas as pd
 from scipy import sparse
 from scipy.optimize import minimize
 from scipy.sparse.linalg import spsolve
@@ -34,7 +33,16 @@ from .stream import (
     iter_matrix_chunks,
 )
 from .types import StreamFeatureStats
-from .utils import max_rss_kb, ordered_unique, ordered_union_indices, to_jsonable
+from .utils import (
+    background_cluster_codes as parse_background_cluster_codes,
+    clean_obs_labels,
+    group_rows_by_active_set,
+    max_rss_kb,
+    ordered_union_indices,
+    parse_perturbation_labels,
+    ps_score_long_dataframe,
+    to_jsonable,
+)
 
 
 DEFAULT_TARGET_SUM = 1e4
@@ -65,15 +73,6 @@ class ExactFastMultiLabelPsResult:
     beta: np.ndarray
     union_gene_indices: np.ndarray
     metadata: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class _ParsedPerturbations:
-    perturbations: list[str]
-    guides: sparse.csr_matrix
-    control_mask: np.ndarray
-    model_mask: np.ndarray
-    active_counts: np.ndarray
 
 
 @dataclass
@@ -119,12 +118,12 @@ def run_ps_score_exact_fast(
 
     dataset_path = Path(data) if isinstance(data, (str, Path)) else None
     adata = ad.read_h5ad(dataset_path, backed="r") if dataset_path is not None else data
-    labels = _clean_obs_labels(adata, perturb_column)
+    labels = clean_obs_labels(adata, perturb_column)
     obs_index = np.asarray(adata.obs_names, dtype=object)
     matrix = extract_anndata_matrix(adata, layer=layer)
-    parsed = _parse_perturbations(labels, mode=mode, ctrl_name=ctrl_name, perturbations=perturbations)
+    parsed = parse_perturbation_labels(labels, mode=mode, ctrl_name=ctrl_name, perturbations=perturbations)
     var_names = np.asarray(adata.var_names, dtype=object)
-    background_cluster_codes, background_cluster_names = _background_cluster_codes(adata, background_cluster_column)
+    background_cluster_codes, background_cluster_names = parse_background_cluster_codes(adata, background_cluster_column)
     stage_start = time.perf_counter()
 
     full_stats_seconds = 0.0
@@ -423,53 +422,33 @@ def write_ps_score_exact_fast_output(
     return manifest
 
 
-def _score_result_dataframe(result: ExactFastPsResult | ExactFastMultiLabelPsResult) -> pd.DataFrame:
+def _score_result_dataframe(result: ExactFastPsResult | ExactFastMultiLabelPsResult) -> Any:
     if isinstance(result, ExactFastMultiLabelPsResult):
-        perturbation_names = np.asarray(result.perturbations, dtype=object)
-        control_rows = np.flatnonzero(result.control_mask)
-        missing_rows = np.flatnonzero(~result.control_mask & ~result.valid_mask)
-        table = pd.concat(
-            [
-                pd.DataFrame(
-                    {
-                        "_row_order": result.cell_indices,
-                        "_perturbation_order": result.perturbation_indices,
-                        "obs_index": result.obs_index[result.cell_indices],
-                        "ps_score": result.scores.astype(np.float64, copy=False),
-                        "perturbation": perturbation_names[result.perturbation_indices],
-                    }
-                ),
-                pd.DataFrame(
-                    {
-                        "_row_order": control_rows,
-                        "_perturbation_order": np.full(control_rows.shape[0], -1, dtype=np.int32),
-                        "obs_index": result.obs_index[control_rows],
-                        "ps_score": np.zeros(control_rows.shape[0], dtype=np.float64),
-                        "perturbation": np.full(control_rows.shape[0], result.metadata["control_label"], dtype=object),
-                    }
-                ),
-                pd.DataFrame(
-                    {
-                        "_row_order": missing_rows,
-                        "_perturbation_order": np.full(missing_rows.shape[0], -1, dtype=np.int32),
-                        "obs_index": result.obs_index[missing_rows],
-                        "ps_score": np.full(missing_rows.shape[0], np.nan, dtype=np.float64),
-                        "perturbation": np.full(missing_rows.shape[0], None, dtype=object),
-                    }
-                ),
-            ],
-            ignore_index=True,
+        return ps_score_long_dataframe(
+            obs_index=result.obs_index,
+            control_mask=result.control_mask,
+            valid_mask=result.valid_mask,
+            scores=result.scores.astype(np.float64, copy=False),
+            cell_indices=result.cell_indices,
+            perturbation_indices=result.perturbation_indices,
+            perturbations=result.perturbations,
+            ctrl_name=result.metadata["control_label"],
         )
-        table.sort_values(["_row_order", "_perturbation_order"], kind="stable", inplace=True)
-        return table[["obs_index", "ps_score", "perturbation"]]
 
-    scores = np.full(result.obs_index.shape[0], np.nan, dtype=np.float64)
-    perturbations = np.full(result.obs_index.shape[0], None, dtype=object)
-    scores[result.control_mask] = 0.0
-    perturbations[result.control_mask] = result.metadata["control_label"]
-    scores[result.valid_mask] = result.scores[result.valid_mask, 0].astype(np.float64, copy=False)
-    perturbations[result.valid_mask] = result.labels[result.valid_mask]
-    return pd.DataFrame({"obs_index": result.obs_index, "ps_score": scores, "perturbation": perturbations})
+    scored_rows = np.flatnonzero(result.valid_mask)
+    perturbations = result.metadata["selected_perturbations"]
+    lookup = {perturbation: index for index, perturbation in enumerate(perturbations)}
+    perturbation_indices = np.asarray([lookup[str(label)] for label in result.labels[scored_rows]], dtype=np.int32)
+    return ps_score_long_dataframe(
+        obs_index=result.obs_index,
+        control_mask=result.control_mask,
+        valid_mask=result.valid_mask,
+        scores=result.scores[scored_rows, 0].astype(np.float64, copy=False),
+        cell_indices=scored_rows,
+        perturbation_indices=perturbation_indices,
+        perturbations=perturbations,
+        ctrl_name=result.metadata["control_label"],
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -521,98 +500,6 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         clip_quantile=args.clip_quantile,
         clip_bins=args.clip_bins,
     )
-
-
-def _clean_obs_labels(adata: Any, perturb_column: str) -> np.ndarray:
-    raw = np.asarray(adata.obs[perturb_column], dtype=object)
-    labels: list[str] = []
-    for row_index, value in enumerate(raw):
-        if pd.isna(value):
-            raise ValueError(f"Missing perturbation label at obs row {row_index}")
-        label = str(value)
-        if not label:
-            raise ValueError(f"Empty perturbation label at obs row {row_index}")
-        labels.append(label)
-    return np.asarray(labels, dtype=object)
-
-
-def _background_cluster_codes(adata: Any, cluster_column: str | None) -> tuple[np.ndarray | None, list[str]]:
-    if cluster_column is None:
-        return None, []
-    raw = np.asarray(adata.obs[cluster_column], dtype=object)
-    labels: list[str] = []
-    for row_index, value in enumerate(raw):
-        if pd.isna(value):
-            raise ValueError(f"Missing background cluster label at obs row {row_index}")
-        label = str(value)
-        if not label:
-            raise ValueError(f"Empty background cluster label at obs row {row_index}")
-        labels.append(label)
-    cluster_names = ordered_unique(labels)
-    lookup = {cluster: index for index, cluster in enumerate(cluster_names)}
-    return np.asarray([lookup[label] for label in labels], dtype=np.int32), cluster_names
-
-
-def _parse_perturbations(
-    labels: np.ndarray,
-    *,
-    mode: str,
-    ctrl_name: str,
-    perturbations: Sequence[str] | None,
-) -> _ParsedPerturbations:
-    tokenized: list[list[str]] = []
-    known: list[str] = []
-    known_set: set[str] = set()
-    control_mask = labels == ctrl_name
-    for row_index, label in enumerate(labels):
-        if label == ctrl_name:
-            tokenized.append([])
-            continue
-        tokens = [str(label)] if mode == "single" else [token.strip() for token in str(label).split("+")]
-        if any(not token for token in tokens):
-            raise ValueError(f"Malformed perturbation value at obs row {row_index}: {label!r}")
-        if ctrl_name in tokens:
-            raise ValueError(f"Control label cannot appear inside a perturbation combination at obs row {row_index}")
-        active = ordered_unique(tokens)
-        tokenized.append(active)
-        for token in active:
-            if token not in known_set:
-                known.append(token)
-                known_set.add(token)
-
-    selected = _select_perturbations(known, perturbations)
-    selected_set = set(selected)
-    selected_lookup = {perturbation: index for index, perturbation in enumerate(selected)}
-    rows: list[int] = []
-    columns: list[int] = []
-    model_mask = control_mask.copy()
-    for row_index, active in enumerate(tokenized):
-        if not active or not set(active).issubset(selected_set):
-            continue
-        model_mask[row_index] = True
-        for perturbation in active:
-            rows.append(row_index)
-            columns.append(selected_lookup[perturbation])
-
-    values = np.ones(len(rows), dtype=np.float64)
-    guides = sparse.csr_matrix((values, (rows, columns)), shape=(labels.shape[0], len(selected)), dtype=np.float64)
-    guides.sort_indices()
-    active_counts = np.asarray(guides.getnnz(axis=1)).ravel().astype(np.int64, copy=False)
-    return _ParsedPerturbations(perturbations=selected, guides=guides, control_mask=control_mask, model_mask=model_mask, active_counts=active_counts)
-
-
-def _select_perturbations(known: Sequence[str], perturbations: Sequence[str] | None) -> list[str]:
-    if not known:
-        raise ValueError("No perturbation labels were found outside the control label")
-    if perturbations is None:
-        return list(known)
-    selected = [str(perturbation) for perturbation in perturbations]
-    if len(set(selected)) != len(selected):
-        raise ValueError("Requested perturbations must be unique")
-    missing = sorted(set(selected) - set(known))
-    if missing:
-        raise ValueError("Requested perturbations are not present in the perturbation column: " + ", ".join(missing))
-    return selected
 
 
 def _select_target_genes(
@@ -903,7 +790,7 @@ def _score_multilabel(
     ):
         row_indices = np.arange(start, stop, dtype=np.int64)
         chunk_cluster_codes = None if cluster_codes is None else cluster_codes[start:stop]
-        for active_set, local_rows in _group_rows_by_active_set(guides[start:stop]).items():
+        for active_set, local_rows in group_rows_by_active_set(guides[start:stop]).items():
             active_indices = np.asarray(active_set, dtype=np.int64)
             active_beta = beta[active_indices + 1]
             gram = active_beta @ active_beta.T
@@ -1107,17 +994,6 @@ def _solve_single_label_background_ridge(
     corrected_rhs = perturbation_rhs - perturbation_cluster_counts @ cluster_background
     perturbation_beta = corrected_rhs / (perturbation_counts + lr_lambda)[:, None]
     return np.vstack([np.zeros((1, corrected_rhs.shape[1]), dtype=np.float64), perturbation_beta])
-
-
-def _group_rows_by_active_set(guides: sparse.csr_matrix) -> dict[tuple[int, ...], np.ndarray]:
-    groups: dict[tuple[int, ...], list[int]] = {}
-    indptr = guides.indptr
-    indices = guides.indices
-    for row_index in range(guides.shape[0]):
-        active = tuple(int(index) for index in indices[indptr[row_index] : indptr[row_index + 1]])
-        if active:
-            groups.setdefault(active, []).append(row_index)
-    return {key: np.asarray(rows, dtype=np.int64) for key, rows in groups.items()}
 
 
 def _solve_bounded_quadratic_scores(*, gram: np.ndarray, rhs: np.ndarray, linear_penalty: float, upper: float) -> np.ndarray:

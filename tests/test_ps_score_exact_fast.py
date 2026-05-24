@@ -52,7 +52,6 @@ def test_exact_fast_histogram_clip_matches_dense_exact_clip() -> None:
         score_lambda=0.0,
         scale_factor=3.0,
         scale_score=True,
-        return_wide=True,
     )
     fast = run_ps_score_exact_fast(
         adata,
@@ -72,7 +71,7 @@ def test_exact_fast_histogram_clip_matches_dense_exact_clip() -> None:
     )
 
     perturbed = labels == "pertA"
-    exact_scores = exact.loc[np.asarray(obs_names, dtype=object)[perturbed], "pertA"].to_numpy(dtype=float)
+    exact_scores = exact.set_index("obs_index").loc[np.asarray(obs_names, dtype=object)[perturbed], "ps_score"].to_numpy(dtype=float)
     fast_scores = fast.scores[perturbed, 0].astype(float)
     assert fast.metadata["target_mode"] == "hvg"
     assert fast.metadata["quantile_clip"] is True

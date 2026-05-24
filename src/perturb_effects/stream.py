@@ -12,6 +12,12 @@ def extract_anndata_matrix(adata: Any, *, layer: str | None = None) -> Any:
     return adata.X if layer is None else adata.layers[layer]
 
 
+def as_csr_matrix(matrix: Any) -> sparse.csr_matrix:
+    if sparse.issparse(matrix):
+        return matrix.tocsr().astype(np.float64, copy=False)
+    return sparse.csr_matrix(np.asarray(matrix, dtype=np.float64))
+
+
 def iter_matrix_chunks(
     matrix: Any,
     *,
@@ -135,3 +141,20 @@ def clip_matrix_columns(matrix: Any, clip_values: np.ndarray) -> Any:
             work.eliminate_zeros()
         return work
     return np.minimum(np.asarray(matrix, dtype=np.float64).copy(), clip_values[None, :])
+
+
+def clip_sparse_columns_by_quantile(matrix: sparse.csr_matrix, quantile: float) -> tuple[sparse.csr_matrix, np.ndarray]:
+    clip_values = sparse_column_quantiles(matrix, quantile)
+    return clip_matrix_columns(matrix, clip_values), clip_values
+
+
+def sparse_column_quantiles(matrix: sparse.csr_matrix, quantile: float) -> np.ndarray:
+    csc = matrix.tocsc()
+    values = np.zeros(csc.shape[1], dtype=np.float64)
+    for column_index in range(csc.shape[1]):
+        start, stop = csc.indptr[column_index], csc.indptr[column_index + 1]
+        nonzero = np.asarray(csc.data[start:stop], dtype=np.float64)
+        zero_count = csc.shape[0] - nonzero.shape[0]
+        column = nonzero if zero_count == 0 else np.concatenate([np.zeros(zero_count, dtype=np.float64), nonzero])
+        values[column_index] = float(np.quantile(column, quantile))
+    return values

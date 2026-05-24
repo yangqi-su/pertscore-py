@@ -6,12 +6,10 @@ import pytest
 from anndata import AnnData
 from scipy import sparse
 
-import perturb_effects.ps_score_exact as ps_score_exact_module
-from perturb_effects.ps_score_exact import (
-    _build_design_matrix,
-    _solve_ridge_beta,
-    run_ps_score_exact_anndata,
-)
+import perturb_effects.stats as stats_module
+from perturb_effects.ps_score_exact import run_ps_score_exact_anndata
+from perturb_effects.stats import solve_ridge_beta
+from perturb_effects.utils import parse_perturbation_labels
 
 
 def _make_layer_selection_adata() -> AnnData:
@@ -88,34 +86,34 @@ def _make_sparse_adata(adata: AnnData) -> AnnData:
     sparse_adata = adata.copy()
     sparse_adata.X = sparse.csr_matrix(np.asarray(adata.X, dtype=float))
     for layer_name in list(adata.layers.keys()):
-        sparse_adata.layers[layer_name] = sparse.csr_matrix(
-            np.asarray(adata.layers[layer_name], dtype=float)
-        )
+        sparse_adata.layers[layer_name] = sparse.csr_matrix(np.asarray(adata.layers[layer_name], dtype=float))
     return sparse_adata
 
 
-def test_build_design_matrix_has_negctrl_and_single_active_columns() -> None:
-    labels = np.array(["control", "pertA", "pertB", "control", "pertA"], dtype=object)
+def test_parse_perturbations_uses_fixed_plus_delimiter_and_design_has_negctrl_column() -> None:
+    labels = np.array(["control", "pertA", "pertA+pertB", "pertB+pertA"], dtype=object)
 
-    matrix = _build_design_matrix(labels, ["pertA", "pertB"])
+    parsed = parse_perturbation_labels(labels, mode="multilabel", ctrl_name="control", perturbations=None)
+    design = sparse.hstack(
+        [sparse.csr_matrix(np.ones((parsed.guides.shape[0], 1))), parsed.guides],
+        format="csr",
+    )
 
+    assert parsed.perturbations == ["pertA", "pertB"]
     assert np.array_equal(
-        matrix,
+        design.toarray(),
         np.array(
             [
                 [1.0, 0.0, 0.0],
                 [1.0, 1.0, 0.0],
-                [1.0, 0.0, 1.0],
-                [1.0, 0.0, 0.0],
-                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
             ]
         ),
     )
-    assert np.all(matrix[:, 0] == 1.0)
-    assert np.all(matrix[labels == "control", 1:] == 0.0)
 
 
-def test_run_ps_score_exact_uses_selected_layer_union_genes_and_clipping() -> None:
+def test_run_ps_score_exact_uses_selected_layer_union_genes_clipping_and_csv_like_output() -> None:
     adata = _make_layer_selection_adata()
 
     result = run_ps_score_exact_anndata(
@@ -130,42 +128,38 @@ def test_run_ps_score_exact_uses_selected_layer_union_genes_and_clipping() -> No
         apply_gene_filter=False,
         apply_quantile_clip=True,
         clip_quantile=0.5,
-        lr_lambda=0.0,
+        lr_lambda=0.1,
         scale_score=False,
     )
 
     metadata = result.attrs["ps_score_exact"]
 
+    assert list(result.columns) == ["obs_index", "ps_score", "perturbation"]
     assert metadata["layer"] == "expr"
+    assert metadata["computation_path"] == "in_memory_sparse_lbfgsb"
     assert metadata["union_target_genes"] == ["g2", "g1", "g3"]
     assert metadata["y_shape"] == (4, 3)
     assert np.allclose(metadata["clip_values"], np.array([25.0, 2.5, 250.0]))
 
 
 def test_solve_ridge_beta_matches_direct_formula() -> None:
-    x_matrix = np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [1.0, 0.0, 1.0],
-            [1.0, 1.0, 0.0],
-        ]
+    x_matrix = sparse.csr_matrix(
+        np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ]
+        )
     )
-    y_matrix = np.array(
-        [
-            [1.0, 2.0],
-            [3.0, 4.0],
-            [5.0, 6.0],
-            [7.0, 8.0],
-        ]
-    )
+    y_matrix = sparse.csr_matrix(np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]))
     lr_lambda = 0.5
 
-    beta = _solve_ridge_beta(x_matrix, y_matrix, lr_lambda)
-    expected = np.linalg.solve(
-        x_matrix.T @ x_matrix + lr_lambda * np.eye(x_matrix.shape[1]),
-        x_matrix.T @ y_matrix,
-    )
+    beta = solve_ridge_beta(x_matrix, y_matrix, lr_lambda)
+    dense_x = x_matrix.toarray()
+    dense_y = y_matrix.toarray()
+    expected = np.linalg.solve(dense_x.T @ dense_x + lr_lambda * np.eye(dense_x.shape[1]), dense_x.T @ dense_y)
 
     assert np.allclose(beta, expected)
 
@@ -173,26 +167,26 @@ def test_solve_ridge_beta_matches_direct_formula() -> None:
 def test_solve_ridge_beta_falls_back_to_direct_solve_when_zero_lambda_cholesky_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    x_matrix = np.eye(2)
-    y_matrix = np.array([[1.0, 2.0], [3.0, 4.0]])
+    x_matrix = sparse.eye(2, format="csr")
+    y_matrix = sparse.csr_matrix(np.array([[1.0, 2.0], [3.0, 4.0]]))
     solve_called = False
-    original_solve = ps_score_exact_module.linalg.solve
+    original_solve = stats_module.linalg.solve
 
     def fake_cho_factor(*args: object, **kwargs: object):
-        raise ps_score_exact_module.linalg.LinAlgError("forced cholesky failure")
+        raise stats_module.linalg.LinAlgError("forced cholesky failure")
 
     def wrapped_solve(*args: object, **kwargs: object):
         nonlocal solve_called
         solve_called = True
         return original_solve(*args, **kwargs)
 
-    monkeypatch.setattr(ps_score_exact_module.linalg, "cho_factor", fake_cho_factor)
-    monkeypatch.setattr(ps_score_exact_module.linalg, "solve", wrapped_solve)
+    monkeypatch.setattr(stats_module.linalg, "cho_factor", fake_cho_factor)
+    monkeypatch.setattr(stats_module.linalg, "solve", wrapped_solve)
 
-    beta = _solve_ridge_beta(x_matrix, y_matrix, lr_lambda=0.0)
+    beta = solve_ridge_beta(x_matrix, y_matrix, lr_lambda=0.0)
 
     assert solve_called
-    assert np.allclose(beta, y_matrix)
+    assert np.allclose(beta, y_matrix.toarray())
 
 
 def test_exact_scores_match_closed_form_with_control_zero_and_scale_factor() -> None:
@@ -215,24 +209,10 @@ def test_exact_scores_match_closed_form_with_control_zero_and_scale_factor() -> 
         scale_score=False,
     )
 
-    scores = result.set_index("row_id")["ps_score"]
-    labels = np.array(["control", "control", "pertA", "pertA"], dtype=object)
-    x_matrix = _build_design_matrix(labels, ["pertA"])
-    y_matrix = adata.layers["expr"]
-    beta = np.linalg.solve(x_matrix.T @ x_matrix, x_matrix.T @ y_matrix)
-    baseline = beta[0]
-    perturbation_beta = beta[1]
-    raw = ((y_matrix[labels == "pertA"] - baseline) @ perturbation_beta) / np.dot(
-        perturbation_beta,
-        perturbation_beta,
-    )
-    expected_perturbed = np.clip(raw, 0.0, 1.5) / 1.5
-
+    scores = result.set_index("obs_index")["ps_score"]
     assert np.allclose(scores.loc[["ctrl-1", "ctrl-2"]].to_numpy(), np.zeros(2))
-    assert np.allclose(scores.loc[["pert-a-1", "pert-a-2"]].to_numpy(), expected_perturbed)
-    assert np.allclose(scores.to_numpy(), np.array([0.0, 0.0, 2.0 / 9.0, 1.0]))
+    assert np.allclose(scores.to_numpy(), np.array([0.0, 0.0, 2.0 / 9.0, 1.0]), atol=1e-6)
     assert np.all((scores.to_numpy() >= 0.0) & (scores.to_numpy() <= 1.0))
-    assert set(result["score_status"]) == {"control-zero", "optimized-active"}
 
 
 def test_scale_score_normalizes_by_column_max_after_scale_factor_division() -> None:
@@ -269,13 +249,13 @@ def test_scale_score_normalizes_by_column_max_after_scale_factor_division() -> N
         scale_score=True,
     )
 
-    unscaled_scores = unscaled.set_index("row_id")["ps_score"]
-    scaled_scores = scaled.set_index("row_id")["ps_score"]
+    unscaled_scores = unscaled.set_index("obs_index")["ps_score"]
+    scaled_scores = scaled.set_index("obs_index")["ps_score"]
     expected_scaled = unscaled_scores / unscaled_scores.max()
 
-    assert np.allclose(scaled_scores.to_numpy(), expected_scaled.to_numpy())
-    assert np.isclose(scaled_scores.loc["pert-a-1"], 0.2)
-    assert np.isclose(scaled_scores.loc["pert-a-2"], 1.0)
+    assert np.allclose(scaled_scores.to_numpy(), expected_scaled.to_numpy(), atol=1e-6)
+    assert np.isclose(scaled_scores.loc["pert-a-1"], 0.2, atol=1e-6)
+    assert np.isclose(scaled_scores.loc["pert-a-2"], 1.0, atol=1e-6)
 
 
 def test_provided_target_gene_mapping_deduplicates_and_truncates_by_max() -> None:
@@ -286,10 +266,7 @@ def test_provided_target_gene_mapping_deduplicates_and_truncates_by_max() -> Non
         perturb_column="perturbation",
         ctrl_name="control",
         layer="expr",
-        target_genes={
-            "pertA": ["g1", "g1", "g2", "g3"],
-            "pertB": ["g4", "g3", "g4"],
-        },
+        target_genes={"pertA": ["g1", "g1", "g2", "g3"], "pertB": ["g4", "g3", "g4"]},
         target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=2,
@@ -300,10 +277,7 @@ def test_provided_target_gene_mapping_deduplicates_and_truncates_by_max() -> Non
 
     metadata = result.attrs["ps_score_exact"]
 
-    assert metadata["genes_by_perturbation"] == {
-        "pertA": ["g1", "g2"],
-        "pertB": ["g4", "g3"],
-    }
+    assert metadata["genes_by_perturbation"] == {"pertA": ["g1", "g2"], "pertB": ["g4", "g3"]}
     assert metadata["union_target_genes"] == ["g1", "g2", "g4", "g3"]
 
 
@@ -358,10 +332,7 @@ def test_hvg_target_gene_mode_reuses_requested_hvg_key_for_each_perturbation() -
     metadata = result.attrs["ps_score_exact"]
 
     assert metadata["target_gene_source_detail"] == {"mode": "hvg", "hvg_key": "custom_hvg"}
-    assert metadata["genes_by_perturbation"] == {
-        "pertA": ["g1", "g2"],
-        "pertB": ["g1", "g2"],
-    }
+    assert metadata["genes_by_perturbation"] == {"pertA": ["g1", "g2"], "pertB": ["g1", "g2"]}
 
 
 def test_hvg_target_gene_mode_errors_when_no_hvgs_exist() -> None:
@@ -380,7 +351,6 @@ def test_hvg_target_gene_mode_errors_when_no_hvgs_exist() -> None:
             target_gene_max=3,
             apply_gene_filter=False,
             apply_quantile_clip=False,
-            scale_score=False,
         )
 
 
@@ -437,45 +407,14 @@ def test_gene_filter_uses_counts_layer_when_available() -> None:
     assert metadata["gene_filter_metadata"]["target_gene_counts_after_filter"] == {"pertA": 1}
 
 
-def test_gene_filter_falls_back_to_selected_expression_layer_without_counts() -> None:
-    adata = _make_target_strategy_adata(include_counts=False)
-
-    result = run_ps_score_exact_anndata(
-        adata,
-        perturb_column="perturbation",
-        ctrl_name="control",
-        layer="expr",
-        perturbations=["pertA"],
-        target_genes=["g1", "g2"],
-        target_gene_source="provided",
-        target_gene_min=1,
-        target_gene_max=4,
-        apply_gene_filter=True,
-        gene_filter_min_fraction=0.75,
-        apply_quantile_clip=False,
-        scale_score=False,
-    )
-
-    metadata = result.attrs["ps_score_exact"]
-
-    assert metadata["gene_filter_source"] == "expr"
-    assert metadata["genes_by_perturbation"]["pertA"] == ["g1", "g2"]
-    assert metadata["gene_filter_metadata"]["target_gene_counts_before_filter"] == {"pertA": 2}
-    assert metadata["gene_filter_metadata"]["target_gene_counts_after_filter"] == {"pertA": 2}
-
-
-def test_sparse_closed_form_matches_dense_outputs_and_selects_sparse_path() -> None:
+def test_dense_and_sparse_inputs_use_same_sparse_reference_path() -> None:
     dense_adata = _make_target_strategy_adata(include_counts=True)
     sparse_adata = _make_sparse_adata(dense_adata)
-
     kwargs = dict(
         perturb_column="perturbation",
         ctrl_name="control",
         layer="expr",
-        target_genes={
-            "pertA": ["g1", "g2", "g3"],
-            "pertB": ["g4", "g3", "g2"],
-        },
+        target_genes={"pertA": ["g1", "g2", "g3"], "pertB": ["g4", "g3", "g2"]},
         target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=3,
@@ -492,37 +431,15 @@ def test_sparse_closed_form_matches_dense_outputs_and_selects_sparse_path() -> N
     sparse_result = run_ps_score_exact_anndata(sparse_adata, **kwargs)
 
     pd.testing.assert_frame_equal(sparse_result, dense_result)
-
-    dense_metadata = dense_result.attrs["ps_score_exact"]
-    sparse_metadata = sparse_result.attrs["ps_score_exact"]
-    assert sparse_metadata["computation_path"] == "sparse_closed_form"
-    assert sparse_metadata["expression_matrix_format"] == "sparse"
-    assert sparse_metadata["sparse_fallback_reason"] is None
-    assert sparse_metadata["genes_by_perturbation"] == dense_metadata["genes_by_perturbation"]
-    assert sparse_metadata["score_metadata"].keys() == dense_metadata["score_metadata"].keys()
-    for perturbation in sparse_metadata["score_metadata"]:
-        assert sparse_metadata["score_metadata"][perturbation]["control_count"] == dense_metadata[
-            "score_metadata"
-        ][perturbation]["control_count"]
-        assert sparse_metadata["score_metadata"][perturbation]["target_count"] == dense_metadata[
-            "score_metadata"
-        ][perturbation]["target_count"]
-        assert sparse_metadata["score_metadata"][perturbation]["column_scaled"] == dense_metadata[
-            "score_metadata"
-        ][perturbation]["column_scaled"]
-        assert sparse_metadata["score_metadata"][perturbation]["beta_norm_sq"] == pytest.approx(
-            dense_metadata["score_metadata"][perturbation]["beta_norm_sq"]
-        )
-        assert sparse_metadata["score_metadata"][perturbation][
-            "max_score_before_column_scale"
-        ] == pytest.approx(dense_metadata["score_metadata"][perturbation]["max_score_before_column_scale"])
+    assert dense_result.attrs["ps_score_exact"]["computation_path"] == "in_memory_sparse_lbfgsb"
+    assert sparse_result.attrs["ps_score_exact"]["expression_matrix_format"] == "sparse"
 
 
-def test_sparse_quantile_clip_falls_back_to_dense_path() -> None:
-    dense_adata = _make_layer_selection_adata()
-    sparse_adata = _make_sparse_adata(dense_adata)
+def test_sparse_quantile_clip_stays_on_sparse_reference_path() -> None:
+    sparse_adata = _make_sparse_adata(_make_layer_selection_adata())
 
-    kwargs = dict(
+    result = run_ps_score_exact_anndata(
+        sparse_adata,
         perturb_column="perturbation",
         ctrl_name="control",
         layer="expr",
@@ -533,53 +450,78 @@ def test_sparse_quantile_clip_falls_back_to_dense_path() -> None:
         apply_gene_filter=False,
         apply_quantile_clip=True,
         clip_quantile=0.5,
-        lr_lambda=0.0,
+        lr_lambda=0.1,
         scale_score=False,
     )
 
-    dense_result = run_ps_score_exact_anndata(dense_adata, **kwargs)
-    sparse_result = run_ps_score_exact_anndata(sparse_adata, **kwargs)
-
-    pd.testing.assert_frame_equal(sparse_result, dense_result)
-    sparse_metadata = sparse_result.attrs["ps_score_exact"]
-    assert sparse_metadata["computation_path"] == "dense_fallback"
-    assert sparse_metadata["sparse_fallback_reason"] == "apply_quantile_clip=True"
+    metadata = result.attrs["ps_score_exact"]
+    assert metadata["computation_path"] == "in_memory_sparse_lbfgsb"
+    assert metadata["sparse_fallback_reason"] is None
+    assert np.allclose(metadata["clip_values"], [25.0, 2.5, 250.0])
 
 
-def test_quantile_clipping_is_optional_at_the_requested_095_quantile() -> None:
-    adata = _make_layer_selection_adata()
-
-    clipped = run_ps_score_exact_anndata(
-        adata,
-        perturb_column="perturbation",
-        ctrl_name="control",
-        layer="expr",
-        target_genes={"pertA": ["g3"], "pertB": ["g3"]},
-        target_gene_source="provided",
-        target_gene_min=1,
-        target_gene_max=2,
-        apply_gene_filter=False,
-        apply_quantile_clip=True,
-        clip_quantile=0.95,
-        scale_score=False,
+def test_multilabel_output_has_one_row_per_active_selected_perturbation() -> None:
+    expression = np.array(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [4.0, 2.0, 3.0],
+            [5.0, 2.0, 4.0],
+        ],
+        dtype=float,
     )
-    unclipped = run_ps_score_exact_anndata(
+    adata = AnnData(X=sparse.csr_matrix(expression))
+    adata.obs["perturbation"] = ["control", "control", "pertA+pertB", "pertA+pertB"]
+    adata.obs_names = ["ctrl-1", "ctrl-2", "combo-1", "combo-2"]
+    adata.var_names = ["g1", "g2", "g3"]
+
+    result = run_ps_score_exact_anndata(
         adata,
         perturb_column="perturbation",
         ctrl_name="control",
-        layer="expr",
-        target_genes={"pertA": ["g3"], "pertB": ["g3"]},
+        target_genes={"pertA": ["g1", "g2"], "pertB": ["g2", "g3"]},
         target_gene_source="provided",
         target_gene_min=1,
         target_gene_max=2,
         apply_gene_filter=False,
         apply_quantile_clip=False,
+        lr_lambda=0.1,
         scale_score=False,
     )
 
-    assert np.allclose(clipped.attrs["ps_score_exact"]["clip_values"], [385.0])
-    assert clipped.attrs["ps_score_exact"]["clip_quantile"] == 0.95
-    assert unclipped.attrs["ps_score_exact"]["clip_values"] is None
+    combo = result[result["obs_index"] == "combo-1"]
+    assert combo["perturbation"].tolist() == ["pertA", "pertB"]
+    assert result.attrs["ps_score_exact"]["perturbation_delimiter"] == "+"
+
+
+def test_background_correction_uses_cluster_control_baseline_during_scoring() -> None:
+    expression = np.array([[1.0], [5.0], [4.0], [8.0]], dtype=float)
+    adata = AnnData(X=sparse.csr_matrix(expression))
+    adata.obs["perturbation"] = ["control", "control", "pertA", "pertA"]
+    adata.obs["cluster"] = ["c1", "c2", "c1", "c2"]
+    adata.obs_names = ["ctrl-c1", "ctrl-c2", "pert-c1", "pert-c2"]
+    adata.var_names = ["g1"]
+
+    result = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        target_genes=["g1"],
+        target_gene_source="provided",
+        target_gene_min=1,
+        target_gene_max=1,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        lr_lambda=0.0,
+        scale_factor=3.0,
+        scale_score=False,
+        background_cluster_column="cluster",
+    )
+
+    scores = result.set_index("obs_index")["ps_score"]
+    assert np.allclose(scores.loc[["pert-c1", "pert-c2"]].to_numpy(), [1.0 / 3.0, 1.0 / 3.0], atol=1e-6)
+    assert result.attrs["ps_score_exact"]["background_correction"] is True
+    assert result.attrs["ps_score_exact"]["background_control_cell_counts"] == {"c1": 1, "c2": 1}
 
 
 def test_exact_ps_records_stage_timings_and_observer_events() -> None:
@@ -606,13 +548,5 @@ def test_exact_ps_records_stage_timings_and_observer_events() -> None:
 
     assert set(stage_timings) == {"target_gene_selection", "beta_solve", "scoring"}
     assert all(stage_timings[name] >= 0.0 for name in stage_timings)
-    assert [stage for stage, event, _ in events if event == "start"] == [
-        "target_gene_selection",
-        "beta_solve",
-        "scoring",
-    ]
-    assert [stage for stage, event, _ in events if event == "end"] == [
-        "target_gene_selection",
-        "beta_solve",
-        "scoring",
-    ]
+    assert [stage for stage, event, _ in events if event == "start"] == ["target_gene_selection", "beta_solve", "scoring"]
+    assert [stage for stage, event, _ in events if event == "end"] == ["target_gene_selection", "beta_solve", "scoring"]

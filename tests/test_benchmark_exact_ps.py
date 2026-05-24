@@ -156,7 +156,7 @@ def test_benchmark_runner_writes_summary_and_progress_logs(tmp_path) -> None:
         "scoring",
         "output_report_write",
     }
-    assert saved["result_summary"]["computation_path"] == "sparse_closed_form"
+    assert saved["result_summary"]["computation_path"] == "in_memory_sparse_lbfgsb"
     assert saved["feasibility"]["sampled_perturbation_count"] == 2
     assert "exact_stage_event" in progress_path.read_text(encoding="utf-8")
 
