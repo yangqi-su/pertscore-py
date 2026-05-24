@@ -12,18 +12,24 @@ from typing import Any
 
 import anndata as ad
 import numpy as np
-import pandas as pd
 from scipy import sparse
 
 from .stats import FeatureMoments, top_k_indices, welch_t_scores_from_stats
 from .stream import (
     accumulate_nonzero_histogram,
-    clip_matrix_columns,
     clip_values_from_histogram,
     extract_anndata_matrix,
-    log_normalize_chunk,
+    iter_matrix_chunks,
 )
-from .utils import is_missing_label, max_rss_kb, ordered_union_indices, to_jsonable
+from .utils import (
+    is_missing_label,
+    max_rss_kb,
+    ordered_union_indices,
+    ordered_unique,
+    ps_score_long_dataframe,
+    resolve_perturbations,
+    to_jsonable,
+)
 
 
 DEFAULT_TARGET_SUM = 1e4
@@ -43,16 +49,15 @@ class FastApproxPsResult:
 @dataclass(frozen=True)
 class _Signature:
     gene_indices: np.ndarray
-    gene_names: list[str]
     beta: np.ndarray
     control_mean: np.ndarray
     beta_norm: float
-    cell_count: int
 
 
-def run_ps_score_fast_approx_anndata(
-    adata: Any,
+def run_ps_score_fast_approx(
+    data: Any,
     *,
+    output_dir: str | Path | None = None,
     perturb_column: str,
     ctrl_name: str,
     layer: str | None = None,
@@ -66,7 +71,7 @@ def run_ps_score_fast_approx_anndata(
     clip_quantile: float | None = None,
     clip_bins: int = DEFAULT_CLIP_BINS,
     target_basis: str = "per_perturbation",
-) -> FastApproxPsResult:
+) -> FastApproxPsResult | dict[str, Any]:
     """Score each cell only against its observed perturbation label."""
 
     if target_basis not in {"per_perturbation", "union"}:
@@ -76,7 +81,14 @@ def run_ps_score_fast_approx_anndata(
     if clip_bins < 2:
         raise ValueError("clip_bins must be >= 2")
 
-    labels = np.asarray(adata.obs[perturb_column], dtype=object)
+    dataset_path = Path(data) if isinstance(data, (str, Path)) else None
+    adata = ad.read_h5ad(dataset_path, backed="r") if dataset_path is not None else data
+
+    raw_labels = np.asarray(adata.obs[perturb_column], dtype=object)
+    labels = np.asarray(
+        [label if is_missing_label(label) else str(label) for label in raw_labels],
+        dtype=object,
+    )
     obs_index = np.asarray(adata.obs_names, dtype=object)
     if labels.ndim != 1 or labels.size == 0:
         raise ValueError("adata must contain at least one observation")
@@ -88,14 +100,21 @@ def run_ps_score_fast_approx_anndata(
         raise ValueError("adata.var_names must be a non-empty one-dimensional sequence")
 
     matrix = extract_anndata_matrix(adata, layer=layer)
-    null_label_set = _normalize_label_set(null_labels)
-    selected = _resolve_selected_perturbations(
-        labels,
-        control_label=ctrl_name,
-        perturbations=perturbations,
-        null_labels=null_label_set,
-    )
+    null_label_set = set() if null_labels is None else {str(label) for label in null_labels}
+    if perturbations is not None and any(str(perturbation) == ctrl_name for perturbation in perturbations):
+        raise ValueError("control label cannot be included in perturbations")
+    requested = None if perturbations is None else [str(perturbation) for perturbation in perturbations]
+    selected = [
+        str(perturbation)
+        for perturbation in resolve_perturbations(
+            labels,
+            control_label=ctrl_name,
+            perturbations=requested,
+            null_labels=null_label_set,
+        )
+    ]
     selected_set = set(selected)
+    model_label_set = selected_set | {ctrl_name}
 
     stage_start = time.perf_counter()
     stats_by_label: dict[str, FeatureMoments] = {
@@ -112,12 +131,18 @@ def run_ps_score_fast_approx_anndata(
         all_gene_nonzero_counts = np.zeros(var_names.shape[0], dtype=np.int64)
 
     pass1_start = time.perf_counter()
-    for start in range(0, labels.shape[0], chunk_size):
-        stop = min(start + chunk_size, labels.shape[0])
-        chunk = log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
+    for start, stop, chunk in iter_matrix_chunks(
+        matrix,
+        n_obs=labels.shape[0],
+        chunk_size=chunk_size,
+        target_sum=target_sum,
+    ):
         chunk_labels = labels[start:stop]
         if all_gene_hist is not None and all_gene_nonzero_counts is not None:
-            model_mask = _model_label_mask(chunk_labels, ctrl_name=ctrl_name, selected_set=selected_set)
+            model_mask = np.asarray(
+                [not is_missing_label(label) and str(label) in model_label_set for label in chunk_labels],
+                dtype=bool,
+            )
             if np.any(model_mask):
                 accumulate_nonzero_histogram(
                     chunk[model_mask],
@@ -125,7 +150,8 @@ def run_ps_score_fast_approx_anndata(
                     nonzero_counts=all_gene_nonzero_counts,
                     max_value=max_value,
                 )
-        for label_key in _iter_unique_label_keys(chunk_labels):
+        label_keys = ordered_unique([label for label in chunk_labels if not is_missing_label(label)])
+        for label_key in label_keys:
             if label_key == ctrl_name:
                 mask = chunk_labels == ctrl_name
             elif label_key in selected_set:
@@ -144,7 +170,6 @@ def run_ps_score_fast_approx_anndata(
     signature_start = time.perf_counter()
     signatures: dict[str, _Signature] = {}
     skipped: dict[str, dict[str, Any]] = {}
-    signature_metadata: dict[str, dict[str, Any]] = {}
     target_gene_indices_by_perturbation: dict[str, np.ndarray] = {}
     for perturbation in selected:
         perturb_stats = stats_by_label[perturbation].freeze()
@@ -170,17 +195,10 @@ def run_ps_score_fast_approx_anndata(
             if perturbation not in target_gene_indices_by_perturbation:
                 continue
             perturb_stats = stats_by_label[perturbation].freeze()
-            signature, signature_record = _build_signature(
+            signature = _build_signature(
                 projection_gene_indices=target_gene_indices_by_perturbation[perturbation],
-                projection_gene_names=[
-                    str(var_names[index]) for index in target_gene_indices_by_perturbation[perturbation]
-                ],
-                target_gene_names=[
-                    str(var_names[index]) for index in target_gene_indices_by_perturbation[perturbation]
-                ],
                 perturb_mean=perturb_stats.means()[target_gene_indices_by_perturbation[perturbation]],
                 control_mean=control_mean_full[target_gene_indices_by_perturbation[perturbation]],
-                cell_count=int(perturb_stats.count),
                 drop_zero_genes=True,
             )
             if signature is None:
@@ -190,7 +208,6 @@ def run_ps_score_fast_approx_anndata(
                 }
                 continue
             signatures[perturbation] = signature
-            signature_metadata[perturbation] = signature_record
     else:
         union_index_lookup = {int(index): position for position, index in enumerate(union_target_gene_indices)}
         clipped_union_stats: dict[str, FeatureMoments] | None = None
@@ -211,13 +228,17 @@ def run_ps_score_fast_approx_anndata(
             clipped_union_stats = {ctrl_name: FeatureMoments.zeros(union_target_gene_indices.shape[0])}
             for perturbation in target_gene_indices_by_perturbation:
                 clipped_union_stats[perturbation] = FeatureMoments.zeros(union_target_gene_indices.shape[0])
-            for start in range(0, labels.shape[0], chunk_size):
-                stop = min(start + chunk_size, labels.shape[0])
-                chunk = log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
-                chunk = chunk[:, union_target_gene_indices]
-                chunk = clip_matrix_columns(chunk, clip_values)
+            for start, stop, chunk in iter_matrix_chunks(
+                matrix,
+                n_obs=labels.shape[0],
+                chunk_size=chunk_size,
+                target_sum=target_sum,
+                gene_indices=union_target_gene_indices,
+                clip_values=clip_values,
+            ):
                 chunk_labels = labels[start:stop]
-                for label_key in _iter_unique_label_keys(chunk_labels):
+                label_keys = ordered_unique([label for label in chunk_labels if not is_missing_label(label)])
+                for label_key in label_keys:
                     if label_key not in clipped_union_stats:
                         continue
                     mask = chunk_labels == label_key
@@ -233,13 +254,11 @@ def run_ps_score_fast_approx_anndata(
             perturb_stats = stats_by_label[perturbation].freeze()
             if target_basis == "union":
                 projection_gene_indices = np.arange(union_target_gene_indices.shape[0], dtype=np.int64)
-                projection_gene_names = list(union_target_genes)
             else:
                 projection_gene_indices = np.asarray(
                     [union_index_lookup[int(index)] for index in target_gene_indices],
                     dtype=np.int64,
                 )
-                projection_gene_names = [str(var_names[index]) for index in target_gene_indices]
 
             if clipped_union_stats is None:
                 perturb_mean_union = perturb_stats.means()[union_target_gene_indices]
@@ -255,13 +274,10 @@ def run_ps_score_fast_approx_anndata(
                 perturb_mean = perturb_mean_union[projection_gene_indices]
                 control_mean = control_mean_union[projection_gene_indices]
 
-            signature, signature_record = _build_signature(
+            signature = _build_signature(
                 projection_gene_indices=projection_gene_indices,
-                projection_gene_names=projection_gene_names,
-                target_gene_names=[str(var_names[index]) for index in target_gene_indices],
                 perturb_mean=perturb_mean,
                 control_mean=control_mean,
-                cell_count=int(perturb_stats.count),
                 drop_zero_genes=target_basis == "per_perturbation",
             )
             if signature is None:
@@ -271,7 +287,6 @@ def run_ps_score_fast_approx_anndata(
                 }
                 continue
             signatures[perturbation] = signature
-            signature_metadata[perturbation] = signature_record
     signature_seconds = time.perf_counter() - signature_start
 
     raw_scores = np.zeros(labels.shape[0], dtype=np.float32)
@@ -279,16 +294,19 @@ def run_ps_score_fast_approx_anndata(
     max_raw_by_perturbation = {perturbation: 0.0 for perturbation in signatures}
 
     pass2_start = time.perf_counter()
-    for start in range(0, labels.shape[0], chunk_size):
-        stop = min(start + chunk_size, labels.shape[0])
-        chunk = log_normalize_chunk(matrix[start:stop], target_sum=target_sum)
-        if clip_quantile is not None or target_basis == "union":
-            chunk = chunk[:, union_target_gene_indices]
-            if clip_values is not None:
-                chunk = clip_matrix_columns(chunk, clip_values)
+    score_gene_indices = union_target_gene_indices if clip_quantile is not None or target_basis == "union" else None
+    for start, stop, chunk in iter_matrix_chunks(
+        matrix,
+        n_obs=labels.shape[0],
+        chunk_size=chunk_size,
+        target_sum=target_sum,
+        gene_indices=score_gene_indices,
+        clip_values=clip_values,
+    ):
         chunk_labels = labels[start:stop]
         row_indices = np.arange(start, stop, dtype=np.int64)
-        for perturbation in _iter_unique_label_keys(chunk_labels):
+        label_keys = ordered_unique([label for label in chunk_labels if not is_missing_label(label)])
+        for perturbation in label_keys:
             if perturbation not in signatures:
                 continue
             mask = chunk_labels == perturbation
@@ -308,15 +326,13 @@ def run_ps_score_fast_approx_anndata(
     pass2_seconds = time.perf_counter() - pass2_start
 
     scores = np.zeros(labels.shape[0], dtype=np.float32)
-    for perturbation, signature in signatures.items():
+    for perturbation in signatures:
         perturbation_mask = labels == perturbation
         max_raw = max_raw_by_perturbation[perturbation]
         if max_raw > 0.0:
             scores[perturbation_mask] = raw_scores[perturbation_mask] / np.float32(max_raw)
         else:
             scores[perturbation_mask] = 0.0
-        signature_metadata[perturbation]["max_raw_score"] = float(max_raw)
-        signature_metadata[perturbation]["valid_cell_count"] = int(np.count_nonzero(perturbation_mask))
 
     unknown_count = int(
         sum(
@@ -355,7 +371,6 @@ def run_ps_score_fast_approx_anndata(
         "skipped_perturbation_count": int(len(skipped)),
         "union_target_gene_count": int(union_target_gene_indices.shape[0]),
         "union_target_genes": union_target_genes,
-        "signature_metadata": signature_metadata,
         "skipped_perturbations": skipped,
         "timings": {
             "pass1_seconds": float(pass1_seconds),
@@ -367,7 +382,7 @@ def run_ps_score_fast_approx_anndata(
         },
         "max_rss_kb": max_rss_kb(),
     }
-    return FastApproxPsResult(
+    result = FastApproxPsResult(
         scores=scores.reshape(-1, 1),
         valid_mask=valid_mask,
         obs_index=obs_index,
@@ -375,48 +390,9 @@ def run_ps_score_fast_approx_anndata(
         control_mask=labels == ctrl_name,
         metadata=metadata,
     )
-
-
-def run_ps_score_fast_approx_dataset(
-    dataset_path: str | Path,
-    *,
-    output_dir: str | Path,
-    perturb_column: str,
-    ctrl_name: str,
-    layer: str | None = None,
-    perturbations: Sequence[str] | None = None,
-    null_labels: Sequence[str] | None = None,
-    top_n: int = 100,
-    chunk_size: int = 8192,
-    scale_factor: float = 3.0,
-    target_sum: float = DEFAULT_TARGET_SUM,
-    min_cells_per_perturbation: int = 2,
-    clip_quantile: float | None = None,
-    clip_bins: int = DEFAULT_CLIP_BINS,
-    target_basis: str = "per_perturbation",
-) -> dict[str, Any]:
-    adata = ad.read_h5ad(Path(dataset_path), backed="r")
-    result = run_ps_score_fast_approx_anndata(
-        adata,
-        perturb_column=perturb_column,
-        ctrl_name=ctrl_name,
-        layer=layer,
-        perturbations=perturbations,
-        null_labels=null_labels,
-        top_n=top_n,
-        chunk_size=chunk_size,
-        scale_factor=scale_factor,
-        target_sum=target_sum,
-        min_cells_per_perturbation=min_cells_per_perturbation,
-        clip_quantile=clip_quantile,
-        clip_bins=clip_bins,
-        target_basis=target_basis,
-    )
-    return write_ps_score_fast_approx_output(
-        result,
-        output_dir=output_dir,
-        dataset_path=dataset_path,
-    )
+    if output_dir is None:
+        return result
+    return write_ps_score_fast_approx_output(result, output_dir=output_dir, dataset_path=dataset_path)
 
 
 def write_ps_score_fast_approx_output(
@@ -449,14 +425,21 @@ def write_ps_score_fast_approx_output(
     return manifest
 
 
-def _score_result_dataframe(result: FastApproxPsResult) -> pd.DataFrame:
-    scores = np.full(result.obs_index.shape[0], np.nan, dtype=np.float64)
-    perturbations = np.full(result.obs_index.shape[0], None, dtype=object)
-    scores[result.control_mask] = 0.0
-    perturbations[result.control_mask] = result.metadata["control_label"]
-    scores[result.valid_mask] = result.scores[result.valid_mask, 0].astype(np.float64, copy=False)
-    perturbations[result.valid_mask] = result.labels[result.valid_mask]
-    return pd.DataFrame({"obs_index": result.obs_index, "ps_score": scores, "perturbation": perturbations})
+def _score_result_dataframe(result: FastApproxPsResult) -> Any:
+    scored_rows = np.flatnonzero(result.valid_mask)
+    perturbations = result.metadata["selected_perturbations"]
+    lookup = {perturbation: index for index, perturbation in enumerate(perturbations)}
+    perturbation_indices = np.asarray([lookup[str(label)] for label in result.labels[scored_rows]], dtype=np.int32)
+    return ps_score_long_dataframe(
+        obs_index=result.obs_index,
+        control_mask=result.control_mask,
+        valid_mask=result.valid_mask,
+        scores=result.scores[scored_rows, 0].astype(np.float64, copy=False),
+        cell_indices=scored_rows,
+        perturbation_indices=perturbation_indices,
+        perturbations=perturbations,
+        ctrl_name=result.metadata["control_label"],
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -481,7 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
-    return run_ps_score_fast_approx_dataset(
+    return run_ps_score_fast_approx(
         args.dataset_path,
         output_dir=args.output_dir,
         perturb_column=args.perturb_column,
@@ -500,46 +483,6 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     )
 
 
-def _resolve_selected_perturbations(
-    labels: Sequence[Any],
-    *,
-    control_label: str,
-    perturbations: Sequence[str] | None,
-    null_labels: set[str],
-) -> list[str]:
-    available: list[str] = []
-    available_set: set[str] = set()
-    for label in labels:
-        if is_missing_label(label) or label == control_label or label in null_labels:
-            continue
-        key = str(label)
-        if key in available_set:
-            continue
-        available.append(key)
-        available_set.add(key)
-
-    if perturbations is None:
-        return available
-
-    selected: list[str] = []
-    missing: list[str] = []
-    seen: set[str] = set()
-    for perturbation in perturbations:
-        if perturbation == control_label:
-            raise ValueError("control label cannot be included in perturbations")
-        if perturbation in seen:
-            continue
-        if perturbation not in available_set:
-            missing.append(str(perturbation))
-            continue
-        selected.append(str(perturbation))
-        seen.add(str(perturbation))
-
-    if missing:
-        raise ValueError("Unknown perturbation labels requested: " + ", ".join(sorted(missing)))
-    return selected
-
-
 def _project_signature(matrix: Any, signature: _Signature) -> np.ndarray:
     selected = matrix[:, signature.gene_indices]
     if sparse.issparse(selected):
@@ -552,24 +495,14 @@ def _project_signature(matrix: Any, signature: _Signature) -> np.ndarray:
     return centered @ signature.beta / denominator
 
 
-def _normalize_label_set(labels: Sequence[str] | None) -> set[str]:
-    if labels is None:
-        return set()
-    return {str(label) for label in labels}
-
-
 def _build_signature(
     *,
     projection_gene_indices: np.ndarray,
-    projection_gene_names: Sequence[str],
-    target_gene_names: Sequence[str],
     perturb_mean: np.ndarray,
     control_mean: np.ndarray,
-    cell_count: int,
     drop_zero_genes: bool,
-) -> tuple[_Signature | None, dict[str, Any]]:
+) -> _Signature | None:
     gene_indices = np.asarray(projection_gene_indices, dtype=np.int64)
-    gene_names = [str(name) for name in projection_gene_names]
     control = np.asarray(control_mean, dtype=np.float64)
     beta = np.asarray(perturb_mean, dtype=np.float64) - control
     if drop_zero_genes:
@@ -577,54 +510,14 @@ def _build_signature(
         gene_indices = gene_indices[nonzero]
         control = control[nonzero]
         beta = beta[nonzero]
-        gene_names = [gene_names[index] for index in np.flatnonzero(nonzero)]
     beta_norm = float(np.linalg.norm(beta)) if beta.size else 0.0
-    record = {
-        "cell_count": int(cell_count),
-        "target_gene_count": int(len(target_gene_names)),
-        "target_genes": [str(name) for name in target_gene_names],
-        "selected_gene_count": int(gene_indices.shape[0]),
-        "selected_genes": gene_names,
-        "beta_norm": beta_norm,
-    }
     if beta_norm == 0.0:
-        return None, record
-    return (
-        _Signature(
-            gene_indices=gene_indices,
-            gene_names=gene_names,
-            beta=beta.astype(np.float64, copy=False),
-            control_mean=control.astype(np.float64, copy=False),
-            beta_norm=beta_norm,
-            cell_count=int(cell_count),
-        ),
-        record,
-    )
-
-
-def _iter_unique_label_keys(labels: Sequence[Any]) -> list[str]:
-    seen: set[str] = set()
-    unique: list[str] = []
-    for label in labels:
-        if is_missing_label(label):
-            continue
-        key = str(label)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(key)
-    return unique
-
-
-def _model_label_mask(
-    labels: Sequence[Any],
-    *,
-    ctrl_name: str,
-    selected_set: set[str],
-) -> np.ndarray:
-    return np.asarray(
-        [False if is_missing_label(label) else (str(label) == ctrl_name or str(label) in selected_set) for label in labels],
-        dtype=bool,
+        return None
+    return _Signature(
+        gene_indices=gene_indices,
+        beta=beta.astype(np.float64, copy=False),
+        control_mean=control.astype(np.float64, copy=False),
+        beta_norm=beta_norm,
     )
 
 
@@ -632,7 +525,6 @@ __all__ = [
     "FastApproxPsResult",
     "build_parser",
     "main",
-    "run_ps_score_fast_approx_anndata",
-    "run_ps_score_fast_approx_dataset",
+    "run_ps_score_fast_approx",
     "write_ps_score_fast_approx_output",
 ]

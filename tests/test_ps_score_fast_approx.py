@@ -7,7 +7,7 @@ import pandas as pd
 from anndata import AnnData
 from scipy import sparse
 
-from perturb_effects.ps_score_fast_approx import main, run_ps_score_fast_approx_anndata
+from perturb_effects.ps_score_fast_approx import main, run_ps_score_fast_approx
 
 
 def _make_fast_approx_adata() -> AnnData:
@@ -125,7 +125,7 @@ def _make_clip_demo_adata() -> AnnData:
 
 
 def test_fast_approx_scores_have_expected_shape_and_zero_invalid_rows() -> None:
-    result = run_ps_score_fast_approx_anndata(
+    result = run_ps_score_fast_approx(
         _make_fast_approx_adata(),
         perturb_column="perturbation",
         ctrl_name="control",
@@ -149,7 +149,7 @@ def test_fast_approx_scores_have_expected_shape_and_zero_invalid_rows() -> None:
 
 
 def test_fast_approx_scores_use_only_the_observed_perturbation_signature() -> None:
-    result = run_ps_score_fast_approx_anndata(
+    result = run_ps_score_fast_approx(
         _make_observed_only_adata(),
         perturb_column="perturbation",
         ctrl_name="control",
@@ -158,20 +158,16 @@ def test_fast_approx_scores_use_only_the_observed_perturbation_signature() -> No
         min_cells_per_perturbation=2,
     )
 
-    scores = result.metadata["signature_metadata"]
-
     assert np.isclose(result.scores[4, 0], 0.0)
     assert np.isclose(result.scores[7, 0], 0.0)
     assert result.scores[2, 0] > 0.0
     assert result.scores[5, 0] > 0.0
-    assert scores["pertA"]["max_raw_score"] > 0.0
-    assert scores["pertB"]["max_raw_score"] > 0.0
-    assert scores["pertA"]["selected_gene_count"] == 1
-    assert scores["pertB"]["selected_gene_count"] == 1
+    assert result.metadata["valid_perturbation_count"] == 2
+    assert "signature_metadata" not in result.metadata
 
 
 def test_fast_approx_handles_mixed_string_and_nan_labels() -> None:
-    result = run_ps_score_fast_approx_anndata(
+    result = run_ps_score_fast_approx(
         _make_mixed_label_adata(),
         perturb_column="perturbation",
         ctrl_name="control",
@@ -187,7 +183,7 @@ def test_fast_approx_handles_mixed_string_and_nan_labels() -> None:
 
 
 def test_fast_approx_default_options_match_explicit_defaults() -> None:
-    implicit = run_ps_score_fast_approx_anndata(
+    implicit = run_ps_score_fast_approx(
         _make_observed_only_adata(),
         perturb_column="perturbation",
         ctrl_name="control",
@@ -195,7 +191,7 @@ def test_fast_approx_default_options_match_explicit_defaults() -> None:
         chunk_size=4,
         min_cells_per_perturbation=2,
     )
-    explicit = run_ps_score_fast_approx_anndata(
+    explicit = run_ps_score_fast_approx(
         _make_observed_only_adata(),
         perturb_column="perturbation",
         ctrl_name="control",
@@ -208,11 +204,11 @@ def test_fast_approx_default_options_match_explicit_defaults() -> None:
 
     assert np.allclose(implicit.scores, explicit.scores)
     assert implicit.valid_mask.tolist() == explicit.valid_mask.tolist()
-    assert implicit.metadata["signature_metadata"] == explicit.metadata["signature_metadata"]
+    assert implicit.metadata["union_target_genes"] == explicit.metadata["union_target_genes"]
 
 
 def test_fast_approx_union_basis_uses_ordered_shared_union() -> None:
-    result = run_ps_score_fast_approx_anndata(
+    result = run_ps_score_fast_approx(
         _make_observed_only_adata(),
         perturb_column="perturbation",
         ctrl_name="control",
@@ -223,19 +219,14 @@ def test_fast_approx_union_basis_uses_ordered_shared_union() -> None:
     )
 
     metadata = result.metadata
-    ordered_targets = [
-        metadata["signature_metadata"]["pertA"]["target_genes"][0],
-        metadata["signature_metadata"]["pertB"]["target_genes"][0],
-    ]
     assert metadata["target_basis"] == "union"
-    assert metadata["union_target_genes"] == ordered_targets
     assert metadata["union_target_gene_count"] == 2
-    assert metadata["signature_metadata"]["pertA"]["selected_genes"] == ordered_targets
-    assert metadata["signature_metadata"]["pertB"]["selected_genes"] == ordered_targets
+    assert set(metadata["union_target_genes"]) == {"g1", "g2"}
+    assert "signature_metadata" not in metadata
 
 
-def test_fast_approx_histclip_changes_signature_metadata_and_scores() -> None:
-    unclipped = run_ps_score_fast_approx_anndata(
+def test_fast_approx_histclip_changes_scores() -> None:
+    unclipped = run_ps_score_fast_approx(
         _make_clip_demo_adata(),
         perturb_column="perturbation",
         ctrl_name="control",
@@ -243,7 +234,7 @@ def test_fast_approx_histclip_changes_signature_metadata_and_scores() -> None:
         chunk_size=3,
         min_cells_per_perturbation=2,
     )
-    clipped = run_ps_score_fast_approx_anndata(
+    clipped = run_ps_score_fast_approx(
         _make_clip_demo_adata(),
         perturb_column="perturbation",
         ctrl_name="control",
@@ -258,7 +249,7 @@ def test_fast_approx_histclip_changes_signature_metadata_and_scores() -> None:
     assert clipped.metadata["clip_quantile"] == 0.5
     assert clipped.metadata["clip_bins"] == 16
     assert clipped.metadata["clip_method"] == "streaming_histogram"
-    assert clipped.metadata["signature_metadata"]["pertA"]["beta_norm"] < unclipped.metadata["signature_metadata"]["pertA"]["beta_norm"]
+    assert "signature_metadata" not in clipped.metadata
     assert not np.allclose(clipped.scores, unclipped.scores)
 
 
