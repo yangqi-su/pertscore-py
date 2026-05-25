@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pertscore-py"
+version = "0.1.0"
+description = "Fast exact perturbation score calculation for h5ad perturb-seq data"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anndata",
+    "numpy",
+    "pandas",
+    "scipy",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

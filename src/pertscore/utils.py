@@ -1,4 +1,4 @@
-"""Small generic helpers shared across perturb_effects modules."""
+"""Small generic helpers shared across pertscore modules."""
 
 from __future__ import annotations
 
