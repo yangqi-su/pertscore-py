@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import resource
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -250,6 +251,11 @@ def resolve_perturbations(
 
 def max_rss_kb() -> int:
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+
+
+def progress_message(message: str, show_progress: bool) -> None:
+    if show_progress:
+        print(f"[pertscore] {message}", file=sys.stderr, flush=True)
 
 
 def to_jsonable(value: Any) -> Any:

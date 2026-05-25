@@ -40,6 +40,7 @@ from .utils import (
     max_rss_kb,
     ordered_union_indices,
     parse_perturbation_labels,
+    progress_message,
     ps_score_long_dataframe,
     to_jsonable,
 )
@@ -104,6 +105,7 @@ def run_ps_score_exact_fast(
     background_cluster_column: str | None = None,
     clip_quantile: float | None = None,
     clip_bins: int = DEFAULT_CLIP_BINS,
+    show_progress: bool = False,
 ) -> ExactFastPsResult | ExactFastMultiLabelPsResult | dict[str, Any]:
     """Run exact-fast PS scoring from an AnnData object or backed h5ad path."""
 
@@ -131,7 +133,14 @@ def run_ps_score_exact_fast(
     full_stats: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None = None
     linear_sums: np.ndarray | None = None
     all_gene_clip_values = None
+    if target_mode == "union_deg":
+        progress_message("Finding target genes: streaming group statistics for Welch t ranking.", show_progress)
+    else:
+        progress_message("Finding target genes: using adata.var['highly_variable'].", show_progress)
     if target_mode == "union_deg" or clip_quantile is not None:
+        progress_desc = "collect DEG/clip stats" if target_mode == "union_deg" and clip_quantile is not None else "collect DEG stats"
+        if target_mode != "union_deg":
+            progress_desc = "collect clip stats"
         stats_start = time.perf_counter()
         sums, squared_sums, counts, linear_sums, all_gene_clip_values = _collect_group_stats(
             matrix,
@@ -144,6 +153,8 @@ def run_ps_score_exact_fast(
             clip_quantile=clip_quantile,
             clip_bins=clip_bins,
             clip_model_mask=parsed.model_mask if clip_quantile is not None else None,
+            show_progress=show_progress,
+            progress_desc=progress_desc,
         )
         first_pass_seconds = time.perf_counter() - stats_start
         if target_mode == "union_deg":
@@ -170,6 +181,10 @@ def run_ps_score_exact_fast(
         logfc_threshold=logfc_threshold,
     )
     union_gene_indices = ordered_union_indices(targets.values())
+    progress_message(
+        f"Selected {union_gene_indices.shape[0]} union target genes across {len(parsed.perturbations)} perturbations.",
+        show_progress,
+    )
     background_enabled = background_cluster_codes is not None
 
     clip_values = None if all_gene_clip_values is None else all_gene_clip_values[union_gene_indices]
@@ -183,6 +198,12 @@ def run_ps_score_exact_fast(
             perturbation_count=parsed.guides.shape[1],
             feature_count=union_gene_indices.shape[0],
         ) if background_enabled else None
+        progress_message(
+            "Estimating beta: fitting background-corrected perturbation effects with ridge regression."
+            if background_stats is not None
+            else "Estimating beta: fitting perturbation effect vectors with ridge regression.",
+            show_progress,
+        )
         if clip_values is None and full_stats is not None and background_stats is None:
             beta_sums = full_stats[0][:, union_gene_indices]
         else:
@@ -197,6 +218,8 @@ def run_ps_score_exact_fast(
                 target_sum=target_sum,
                 cluster_codes=background_cluster_codes,
                 background_stats=background_stats,
+                show_progress=show_progress,
+                progress_desc="collect target/background stats" if background_stats is not None else "collect target stats",
             )
             clipped_stats_seconds = time.perf_counter() - clipped_stats_start
         ridge_start = time.perf_counter()
@@ -238,6 +261,8 @@ def run_ps_score_exact_fast(
             scale_score=scale_score,
             cluster_codes=background_cluster_codes,
             background_projection=background_projection,
+            show_progress=show_progress,
+            progress_desc="score cells",
         )
     else:
         background_stats = _new_background_stats(
@@ -245,6 +270,7 @@ def run_ps_score_exact_fast(
             perturbation_count=parsed.guides.shape[1],
             feature_count=union_gene_indices.shape[0],
         ) if background_enabled else None
+        progress_message("Estimating beta: collecting multilabel ridge sufficient statistics.", show_progress)
         ridge_stats_start = time.perf_counter()
         xtx, xty = _collect_multilabel_ridge_stats(
             matrix,
@@ -256,10 +282,18 @@ def run_ps_score_exact_fast(
             target_sum=target_sum,
             cluster_codes=background_cluster_codes,
             background_stats=background_stats,
+            show_progress=show_progress,
+            progress_desc="collect multilabel ridge stats",
         )
         ridge_stats_seconds = time.perf_counter() - ridge_stats_start
         ridge_start = time.perf_counter()
         background_projection = None
+        progress_message(
+            "Estimating beta: solving background-corrected multilabel ridge regression."
+            if background_stats is not None
+            else "Estimating beta: solving multilabel ridge regression.",
+            show_progress,
+        )
         if background_stats is not None:
             cluster_background = _cluster_background_matrix(
                 background_stats,
@@ -302,6 +336,8 @@ def run_ps_score_exact_fast(
             scale_score=scale_score,
             cluster_codes=background_cluster_codes,
             background_projection=background_projection,
+            show_progress=show_progress,
+            progress_desc="score multilabel cells",
         )
 
     _add_score_metadata(
@@ -471,6 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clip-quantile", type=float)
     parser.add_argument("--clip-bins", type=int, default=DEFAULT_CLIP_BINS)
     parser.add_argument("--perturbation", action="append", dest="perturbations")
+    parser.add_argument("--progress", action="store_true")
     parser.add_argument("--rank-by-signed-t", action="store_true")
     parser.add_argument("--no-scale-score", action="store_true")
     return parser
@@ -478,7 +515,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
-    return run_ps_score_exact_fast(
+    result = run_ps_score_exact_fast(
         args.dataset_path,
         mode=args.mode,
         output_dir=args.output_dir,
@@ -499,7 +536,15 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         background_cluster_column=args.background_cluster_column,
         clip_quantile=args.clip_quantile,
         clip_bins=args.clip_bins,
+        show_progress=args.progress,
     )
+    if not isinstance(result, dict):
+        raise TypeError("CLI run did not return an output manifest")
+    return result
+
+
+def cli(argv: Sequence[str] | None = None) -> None:
+    print(json.dumps(to_jsonable(main(argv)), indent=2, sort_keys=True))
 
 
 def _select_target_genes(
@@ -624,6 +669,8 @@ def _collect_group_stats(
     clip_quantile: float | None = None,
     clip_bins: int = DEFAULT_CLIP_BINS,
     clip_model_mask: np.ndarray | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray, np.ndarray | None, np.ndarray | None]:
     if collect_linear_sums and not collect_moments:
         raise ValueError("linear sums require group moments")
@@ -655,6 +702,8 @@ def _collect_group_stats(
         gene_indices=gene_indices,
         clip_values=clip_values,
         apply_log1p=not collect_linear_sums,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
     ):
         chunk_control = control_mask[start:stop]
         if linear_sums is not None:
@@ -698,6 +747,8 @@ def _score_single_label(
     scale_score: bool,
     cluster_codes: np.ndarray | None = None,
     background_projection: np.ndarray | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     beta_norm_sq = np.einsum("ij,ij->i", beta[1:], beta[1:])
     baseline_projection = None if background_projection is not None else beta[1:] @ beta[0]
@@ -714,6 +765,8 @@ def _score_single_label(
         target_sum=target_sum,
         gene_indices=union_gene_indices,
         clip_values=clip_values,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
     ):
         chunk_codes = codes[start:stop]
         chunk_cluster_codes = None if cluster_codes is None else cluster_codes[start:stop]
@@ -772,6 +825,8 @@ def _score_multilabel(
     scale_score: bool,
     cluster_codes: np.ndarray | None = None,
     background_projection: np.ndarray | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     score_values: list[np.ndarray] = []
     cell_index_values: list[np.ndarray] = []
@@ -787,6 +842,8 @@ def _score_multilabel(
         target_sum=target_sum,
         gene_indices=union_gene_indices,
         clip_values=clip_values,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
     ):
         row_indices = np.arange(start, stop, dtype=np.int64)
         chunk_cluster_codes = None if cluster_codes is None else cluster_codes[start:stop]
@@ -846,6 +903,8 @@ def _collect_multilabel_ridge_stats(
     target_sum: float,
     cluster_codes: np.ndarray | None = None,
     background_stats: _BackgroundStats | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
 ) -> tuple[sparse.csc_matrix, np.ndarray]:
     perturbation_count = guides.shape[1]
     xty = np.zeros((perturbation_count + 1, union_gene_indices.shape[0]), dtype=np.float64)
@@ -860,6 +919,8 @@ def _collect_multilabel_ridge_stats(
         target_sum=target_sum,
         gene_indices=union_gene_indices,
         clip_values=clip_values,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
     ):
         chunk_guides = guides[start:stop]
         if background_stats is not None:
@@ -1098,6 +1159,7 @@ __all__ = [
     "ExactFastMultiLabelPsResult",
     "ExactFastPsResult",
     "build_parser",
+    "cli",
     "main",
     "run_ps_score_exact_fast",
     "write_ps_score_exact_fast_output",
@@ -1105,4 +1167,4 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    print(json.dumps(to_jsonable(main()), indent=2, sort_keys=True))
+    cli()

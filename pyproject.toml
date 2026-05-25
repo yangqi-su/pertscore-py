@@ -13,7 +13,11 @@ dependencies = [
     "numpy",
     "pandas",
     "scipy",
+    "tqdm",
 ]
+
+[project.scripts]
+ps_score_exact_fast = "pertscore.ps_score_exact_fast:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]

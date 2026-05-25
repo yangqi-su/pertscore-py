@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
 from scipy import sparse
+from tqdm import tqdm
 
 
 def extract_anndata_matrix(adata: Any, *, layer: str | None = None) -> Any:
@@ -27,16 +29,25 @@ def iter_matrix_chunks(
     gene_indices: np.ndarray | None = None,
     clip_values: np.ndarray | None = None,
     apply_log1p: bool = True,
-) -> Any:
-    for start in range(0, n_obs, chunk_size):
-        stop = min(start + chunk_size, n_obs)
-        chunk = matrix[start:stop]
-        chunk = log_normalize_chunk(chunk, target_sum=target_sum) if apply_log1p else normalize_chunk(chunk, target_sum=target_sum)
-        if gene_indices is not None:
-            chunk = chunk[:, gene_indices]
-        if clip_values is not None:
-            chunk = clip_matrix_columns(chunk, clip_values)
-        yield start, stop, chunk
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+) -> Iterator[tuple[int, int, Any]]:
+    progress = tqdm(total=n_obs, desc=progress_desc, unit="cells") if show_progress else None
+    try:
+        for start in range(0, n_obs, chunk_size):
+            stop = min(start + chunk_size, n_obs)
+            chunk = matrix[start:stop]
+            chunk = log_normalize_chunk(chunk, target_sum=target_sum) if apply_log1p else normalize_chunk(chunk, target_sum=target_sum)
+            if gene_indices is not None:
+                chunk = chunk[:, gene_indices]
+            if clip_values is not None:
+                chunk = clip_matrix_columns(chunk, clip_values)
+            yield start, stop, chunk
+            if progress is not None:
+                progress.update(stop - start)
+    finally:
+        if progress is not None:
+            progress.close()
 
 
 def normalize_chunk(matrix: Any, *, target_sum: float) -> Any:
