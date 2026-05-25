@@ -14,9 +14,16 @@ import anndata as ad
 import numpy as np
 from scipy import sparse
 
-from .stats import FeatureMoments, top_k_indices, welch_t_scores_from_stats
+from .stats import (
+    FeatureMoments,
+    column_sums,
+    log2_fold_change,
+    top_k_indices,
+    welch_t_scores_from_stats,
+)
 from .stream import (
     accumulate_nonzero_histogram,
+    apply_log1p_chunk,
     clip_values_from_histogram,
     extract_anndata_matrix,
     iter_matrix_chunks,
@@ -71,6 +78,7 @@ def run_ps_score_fast_approx(
     clip_quantile: float | None = None,
     clip_bins: int = DEFAULT_CLIP_BINS,
     target_basis: str = "per_perturbation",
+    logfc_threshold: float | None = 0.1,
 ) -> FastApproxPsResult | dict[str, Any]:
     """Score each cell only against its observed perturbation label."""
 
@@ -80,6 +88,8 @@ def run_ps_score_fast_approx(
         raise ValueError("clip_quantile must be in (0, 1]")
     if clip_bins < 2:
         raise ValueError("clip_bins must be >= 2")
+    if logfc_threshold is not None and logfc_threshold < 0.0:
+        raise ValueError("logfc_threshold must be >= 0")
 
     dataset_path = Path(data) if isinstance(data, (str, Path)) else None
     adata = ad.read_h5ad(dataset_path, backed="r") if dataset_path is not None else data
@@ -120,8 +130,13 @@ def run_ps_score_fast_approx(
     stats_by_label: dict[str, FeatureMoments] = {
         ctrl_name: FeatureMoments.zeros(var_names.shape[0])
     }
+    linear_sums_by_label: dict[str, np.ndarray] | None = None
+    if logfc_threshold is not None:
+        linear_sums_by_label = {ctrl_name: np.zeros(var_names.shape[0], dtype=np.float64)}
     for perturbation in selected:
         stats_by_label[perturbation] = FeatureMoments.zeros(var_names.shape[0])
+        if linear_sums_by_label is not None:
+            linear_sums_by_label[perturbation] = np.zeros(var_names.shape[0], dtype=np.float64)
 
     max_value = float(np.log1p(target_sum))
     all_gene_hist: np.ndarray | None = None
@@ -136,8 +151,19 @@ def run_ps_score_fast_approx(
         n_obs=labels.shape[0],
         chunk_size=chunk_size,
         target_sum=target_sum,
+        apply_log1p=logfc_threshold is None,
     ):
         chunk_labels = labels[start:stop]
+        label_keys = ordered_unique([label for label in chunk_labels if not is_missing_label(label)])
+        if linear_sums_by_label is not None:
+            for label_key in label_keys:
+                if label_key not in linear_sums_by_label:
+                    continue
+                mask = chunk_labels == label_key
+                if mask.any():
+                    linear_sums_by_label[label_key] += column_sums(chunk[mask])
+            chunk = apply_log1p_chunk(chunk)
+
         if all_gene_hist is not None and all_gene_nonzero_counts is not None:
             model_mask = np.asarray(
                 [not is_missing_label(label) and str(label) in model_label_set for label in chunk_labels],
@@ -150,7 +176,6 @@ def run_ps_score_fast_approx(
                     nonzero_counts=all_gene_nonzero_counts,
                     max_value=max_value,
                 )
-        label_keys = ordered_unique([label for label in chunk_labels if not is_missing_label(label)])
         for label_key in label_keys:
             if label_key == ctrl_name:
                 mask = chunk_labels == ctrl_name
@@ -164,6 +189,9 @@ def run_ps_score_fast_approx(
 
     control_stats = stats_by_label[ctrl_name].freeze()
     control_mean_full = control_stats.means()
+    control_linear_mean = None
+    if linear_sums_by_label is not None:
+        control_linear_mean = linear_sums_by_label[ctrl_name] / max(control_stats.count, 1)
     if control_stats.count == 0:
         raise ValueError("control cells are required for fast approximate scoring")
 
@@ -181,7 +209,19 @@ def run_ps_score_fast_approx(
             continue
 
         t_scores = welch_t_scores_from_stats(perturb_stats, control_stats)
-        gene_indices = top_k_indices(t_scores, min(top_n, t_scores.shape[0]), absolute=True)
+        if logfc_threshold is None:
+            gene_indices = top_k_indices(t_scores, min(top_n, t_scores.shape[0]), absolute=True)
+        else:
+            if linear_sums_by_label is None or control_linear_mean is None:
+                raise ValueError("logfc_threshold requires streamed normalized means")
+            perturb_linear_mean = linear_sums_by_label[perturbation] / max(int(perturb_stats.count), 1)
+            logfc = log2_fold_change(perturb_linear_mean, control_linear_mean)
+            candidates = np.flatnonzero(np.abs(logfc) > float(logfc_threshold)).astype(np.int64, copy=False)
+            if candidates.size:
+                ranked = top_k_indices(t_scores[candidates], min(top_n, candidates.shape[0]), absolute=True)
+                gene_indices = candidates[ranked]
+            else:
+                gene_indices = np.asarray([], dtype=np.int64)
         target_gene_indices_by_perturbation[perturbation] = gene_indices.astype(np.int64, copy=False)
 
     union_target_gene_indices = ordered_union_indices(target_gene_indices_by_perturbation.values())
@@ -353,6 +393,9 @@ def run_ps_score_fast_approx(
         "control_label": ctrl_name,
         "top_gene_count": int(top_n),
         "target_basis": target_basis,
+        "logfc_threshold": None if logfc_threshold is None else float(logfc_threshold),
+        "logfc_base": 2,
+        "logfc_pseudocount": 1.0,
         "quantile_clip": clip_quantile is not None,
         "clip_quantile": None if clip_quantile is None else float(clip_quantile),
         "clip_method": None if clip_quantile is None else "streaming_histogram",
@@ -453,6 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", type=int, default=8192)
     parser.add_argument("--scale-factor", type=float, default=3.0)
     parser.add_argument("--target-sum", type=float, default=DEFAULT_TARGET_SUM)
+    parser.add_argument("--logfc-threshold", type=float)
     parser.add_argument("--clip-quantile", type=float)
     parser.add_argument("--clip-bins", type=int, default=DEFAULT_CLIP_BINS)
     parser.add_argument("--min-cells-per-perturbation", type=int, default=2)
@@ -477,6 +521,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         scale_factor=args.scale_factor,
         target_sum=args.target_sum,
         min_cells_per_perturbation=args.min_cells_per_perturbation,
+        logfc_threshold=args.logfc_threshold,
         clip_quantile=args.clip_quantile,
         clip_bins=args.clip_bins,
         target_basis=args.target_basis,

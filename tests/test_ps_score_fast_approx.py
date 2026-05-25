@@ -124,6 +124,22 @@ def _make_clip_demo_adata() -> AnnData:
     return adata
 
 
+def _make_logfc_filter_adata() -> AnnData:
+    counts = np.array(
+        [
+            [100.0, 100.0, 1.0],
+            [100.0, 100.0, 1.0],
+            [120.0, 100.0, 20.0],
+            [120.0, 100.0, 20.0],
+        ],
+        dtype=float,
+    )
+    adata = AnnData(X=sparse.csr_matrix(counts))
+    adata.obs["perturbation"] = ["control", "control", "pertA", "pertA"]
+    adata.var_names = ["g1", "g2", "g3"]
+    return adata
+
+
 def test_fast_approx_scores_have_expected_shape_and_zero_invalid_rows() -> None:
     result = run_ps_score_fast_approx(
         _make_fast_approx_adata(),
@@ -225,6 +241,31 @@ def test_fast_approx_union_basis_uses_ordered_shared_union() -> None:
     assert "signature_metadata" not in metadata
 
 
+def test_fast_approx_logfc_threshold_filters_before_t_ranking() -> None:
+    unfiltered = run_ps_score_fast_approx(
+        _make_logfc_filter_adata(),
+        perturb_column="perturbation",
+        ctrl_name="control",
+        top_n=1,
+        chunk_size=2,
+        min_cells_per_perturbation=2,
+        logfc_threshold=None,
+    )
+    filtered = run_ps_score_fast_approx(
+        _make_logfc_filter_adata(),
+        perturb_column="perturbation",
+        ctrl_name="control",
+        top_n=1,
+        chunk_size=2,
+        min_cells_per_perturbation=2,
+        logfc_threshold=1.0,
+    )
+
+    assert unfiltered.metadata["union_target_genes"] == ["g1"]
+    assert filtered.metadata["union_target_genes"] == ["g3"]
+    assert filtered.metadata["logfc_threshold"] == 1.0
+
+
 def test_fast_approx_histclip_changes_scores() -> None:
     unclipped = run_ps_score_fast_approx(
         _make_clip_demo_adata(),
@@ -276,6 +317,8 @@ def test_fast_approx_main_writes_manifest_and_outputs(tmp_path) -> None:
             "3",
             "--target-basis",
             "union",
+            "--logfc-threshold",
+            "0.1",
             "--clip-quantile",
             "0.5",
             "--clip-bins",
@@ -294,6 +337,7 @@ def test_fast_approx_main_writes_manifest_and_outputs(tmp_path) -> None:
     assert saved["score_output_format"] == "csv_long"
     assert saved["score_count"] == 8
     assert saved["target_basis"] == "union"
+    assert saved["logfc_threshold"] == 0.1
     assert saved["clip_quantile"] == 0.5
     assert saved["clip_bins"] == 16
     assert saved["clip_method"] == "streaming_histogram"

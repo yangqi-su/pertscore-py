@@ -25,20 +25,17 @@ def test_exact_fast_histogram_clip_matches_dense_exact_clip() -> None:
     )
     labels = np.asarray(["control", "control", "control", "pertA", "pertA", "pertA"], dtype=object)
     obs_names = [f"cell_{index}" for index in range(counts.shape[0])]
-    library_sizes = counts.sum(axis=1, keepdims=True)
-    lognorm = np.log1p((counts / library_sizes) * 1e4)
     adata = AnnData(
         X=sparse.csr_matrix(counts),
         obs=pd.DataFrame({"perturbation": labels}, index=obs_names),
         var=pd.DataFrame({"highly_variable": [True, True, False]}, index=["g1", "g2", "g3"]),
     )
-    adata.layers["lognorm"] = lognorm
 
     exact = run_ps_score_exact_anndata(
         adata,
         perturb_column="perturbation",
         ctrl_name="control",
-        layer="lognorm",
+        layer=None,
         counts_layer=None,
         perturbations=["pertA"],
         target_genes={"pertA": ["g1", "g2"]},

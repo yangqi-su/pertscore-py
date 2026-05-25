@@ -1,9 +1,10 @@
 """In-memory sparse scMAGeCK/R-like PS score reference path.
 
 This implementation keeps the full selected AnnData matrix in memory, converts it
-to CSR, solves ridge beta from sparse sufficient statistics, and optimizes PS
-scores with grouped L-BFGS-B. It is intended as a simple R-like reference path;
-large production runs should use ``ps_score_exact_fast``.
+to CSR, log-normalizes counts, solves ridge beta from sparse sufficient
+statistics, and optimizes PS scores with grouped L-BFGS-B. It is intended as a
+simple R-like reference path; large production runs should use
+``ps_score_exact_fast``.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from scipy import sparse
 from scipy.optimize import minimize
 
 from .stats import solve_ridge_beta
-from .stream import as_csr_matrix, clip_sparse_columns_by_quantile, extract_anndata_matrix
+from .stream import as_csr_matrix, clip_sparse_columns_by_quantile, extract_anndata_matrix, log_normalize_chunk
 from .utils import (
     PERTURBATION_DELIMITER,
     background_cluster_codes as parse_background_cluster_codes,
@@ -34,6 +35,7 @@ SCANPY_DE_METHOD = "wilcoxon"
 SCANPY_DE_LOGFC_THRESHOLD = 0.1
 SCANPY_DE_LOGFC_THRESHOLD_DECAY = 0.8
 SCANPY_DE_MAX_LOGFC_ROUNDS = 3
+DEFAULT_TARGET_SUM = 1e4
 
 
 def run_ps_score_exact_anndata(
@@ -56,6 +58,7 @@ def run_ps_score_exact_anndata(
     lr_lambda: float = 0.01,
     score_lambda: float = 0.0,
     scale_factor: float = 3.0,
+    target_sum: float = DEFAULT_TARGET_SUM,
     scale_score: bool = True,
     background_cluster_column: str | None = None,
 ) -> pd.DataFrame:
@@ -82,7 +85,7 @@ def run_ps_score_exact_anndata(
     gene_lookup = {str(gene): index for index, gene in enumerate(var_names.astype(str))}
     expression_matrix_raw = extract_anndata_matrix(adata, layer=layer)
     expression_matrix_format = "sparse" if sparse.issparse(expression_matrix_raw) else "dense"
-    expression_matrix = as_csr_matrix(expression_matrix_raw)
+    expression_matrix = log_normalize_chunk(as_csr_matrix(expression_matrix_raw), target_sum=target_sum).tocsr()
     if apply_gene_filter and counts_layer is not None and counts_layer in adata.layers:
         filter_matrix, filter_source = as_csr_matrix(adata.layers[counts_layer]), counts_layer
     else:
@@ -117,7 +120,7 @@ def run_ps_score_exact_anndata(
             adata,
             parsed=parsed,
             ctrl_name=ctrl_name,
-            layer=layer,
+            expression_matrix=expression_matrix,
             gene_lookup=gene_lookup,
             target_gene_min=target_gene_min,
             target_gene_max=target_gene_max,
@@ -216,6 +219,8 @@ def run_ps_score_exact_anndata(
         "input_type": "anndata-r-like-sparse",
         "layer": layer,
         "counts_layer": counts_layer,
+        "normalization": "normalize_total_log1p",
+        "target_sum": float(target_sum),
         "perturb_column": perturb_column,
         "ctrl_name": ctrl_name,
         "perturbation_delimiter": PERTURBATION_DELIMITER,
@@ -335,7 +340,7 @@ def _resolve_scanpy_target_genes(
     *,
     parsed: Any,
     ctrl_name: str,
-    layer: str | None,
+    expression_matrix: sparse.csr_matrix,
     gene_lookup: Mapping[str, int],
     target_gene_min: int,
     target_gene_max: int,
@@ -355,6 +360,7 @@ def _resolve_scanpy_target_genes(
         active = np.asarray(parsed.guides[:, perturbation_index].toarray()).ravel() > 0
         subset_mask = parsed.control_mask | active
         subset = adata[subset_mask].copy()
+        subset.X = expression_matrix[subset_mask].copy()
         subset.obs["_ps_score_exact_de_group"] = np.where(active[subset_mask], "target", ctrl_name)
         sc.tl.rank_genes_groups(
             subset,
@@ -362,7 +368,6 @@ def _resolve_scanpy_target_genes(
             groups=["target"],
             reference=ctrl_name,
             use_raw=False,
-            layer=layer,
             n_genes=subset.n_vars,
             method=de_method,
         )

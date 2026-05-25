@@ -137,9 +137,11 @@ def test_run_ps_score_exact_uses_selected_layer_union_genes_clipping_and_csv_lik
     assert list(result.columns) == ["obs_index", "ps_score", "perturbation"]
     assert metadata["layer"] == "expr"
     assert metadata["computation_path"] == "in_memory_sparse_lbfgsb"
+    assert metadata["normalization"] == "normalize_total_log1p"
+    assert metadata["target_sum"] == 1e4
     assert metadata["union_target_genes"] == ["g2", "g1", "g3"]
     assert metadata["y_shape"] == (4, 3)
-    assert np.allclose(metadata["clip_values"], np.array([25.0, 2.5, 250.0]))
+    assert np.allclose(metadata["clip_values"], np.array([6.804504648063392, 4.511849017779065, 9.106091350491896]))
 
 
 def test_solve_ridge_beta_matches_direct_formula() -> None:
@@ -211,7 +213,7 @@ def test_exact_scores_match_closed_form_with_control_zero_and_scale_factor() -> 
 
     scores = result.set_index("obs_index")["ps_score"]
     assert np.allclose(scores.loc[["ctrl-1", "ctrl-2"]].to_numpy(), np.zeros(2))
-    assert np.allclose(scores.to_numpy(), np.array([0.0, 0.0, 2.0 / 9.0, 1.0]), atol=1e-6)
+    assert np.allclose(scores.to_numpy(), np.array([0.0, 0.0, 0.35352564, 0.97980769]), atol=1e-6)
     assert np.all((scores.to_numpy() >= 0.0) & (scores.to_numpy() <= 1.0))
 
 
@@ -254,7 +256,7 @@ def test_scale_score_normalizes_by_column_max_after_scale_factor_division() -> N
     expected_scaled = unscaled_scores / unscaled_scores.max()
 
     assert np.allclose(scaled_scores.to_numpy(), expected_scaled.to_numpy(), atol=1e-6)
-    assert np.isclose(scaled_scores.loc["pert-a-1"], 0.2, atol=1e-6)
+    assert np.isclose(scaled_scores.loc["pert-a-1"], 0.3608112543358848, atol=1e-6)
     assert np.isclose(scaled_scores.loc["pert-a-2"], 1.0, atol=1e-6)
 
 
@@ -466,7 +468,8 @@ def test_sparse_quantile_clip_stays_on_sparse_reference_path() -> None:
     metadata = result.attrs["ps_score_exact"]
     assert metadata["computation_path"] == "in_memory_sparse_lbfgsb"
     assert metadata["sparse_fallback_reason"] is None
-    assert np.allclose(metadata["clip_values"], [25.0, 2.5, 250.0])
+    assert metadata["normalization"] == "normalize_total_log1p"
+    assert np.allclose(metadata["clip_values"], [6.804504648063392, 4.511849017779065, 9.106091350491896])
 
 
 def test_multilabel_output_has_one_row_per_active_selected_perturbation() -> None:
